@@ -8,7 +8,7 @@ The full design is in [docs/design-plan.pdf](docs/design-plan.pdf).
 
 ## Status
 
-The repository is set up, no code yet. Milestones are tracked as GitHub issues.
+There is no code yet. Every goal in the table below is a GitHub issue in the milestone with the same date.
 
 | Until | Goal |
 |---|---|

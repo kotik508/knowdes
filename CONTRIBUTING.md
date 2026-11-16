@@ -13,7 +13,7 @@ Every piece of work is an issue with one person assigned and a milestone (22.11.
 
 ## Code
 
-- Clear names over comments, comments where the reason is not obvious.
+- Use clear names. Write a comment where the reason for the code is not obvious.
 - Every module starts with a docstring that says which part of the design plan it implements.
 - Format and lint with `uv run ruff format` and `uv run ruff check` before you push.
 
