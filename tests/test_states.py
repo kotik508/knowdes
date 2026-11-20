@@ -29,7 +29,7 @@ def test_candidate_votes_for_itself_in_new_term():
     assert g.voted_for == "a"
 
 
-def test_newer_term_turns_leader_into_follower():
+async def test_newer_term_turns_leader_into_follower():
     g = group()
     g.become_candidate()
     g.become_leader()
@@ -37,6 +37,7 @@ def test_newer_term_turns_leader_into_follower():
     assert g.role is Role.FOLLOWER
     assert g.term == 5
     assert g.voted_for is None
+    await g.stop()
 
 
 def test_older_term_changes_nothing():

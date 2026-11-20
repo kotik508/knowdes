@@ -7,6 +7,8 @@ groups on a simulated network.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import enum
 import random
 import time
@@ -19,6 +21,8 @@ Send = Callable[[str, Message], Awaitable[Message | None]]
 # Range of the random election timeout and the heartbeat interval, section 3.4.
 ELECTION_TIMEOUT = (0.15, 0.30)
 HEARTBEAT_INTERVAL = 0.05
+# How often the timer loop looks at the election deadline.
+TICK = 0.01
 
 
 class Role(enum.StrEnum):
@@ -53,6 +57,7 @@ class RaftGroup:
         self.leader: str | None = None
         self.deadline = 0.0
         self.reset_election_timer()
+        self._tasks: list[asyncio.Task] = []
 
     @property
     def majority(self) -> int:
@@ -93,6 +98,98 @@ class RaftGroup:
             raise RuntimeError("only a candidate can become leader")
         self.role = Role.LEADER
         self.leader = self.id
+        self._spawn(self._heartbeats(self.term))
+
+    @property
+    def last_index(self) -> int:
+        return 0
+
+    @property
+    def last_term(self) -> int:
+        return 0
+
+    # Timer and background tasks.
+
+    def start(self) -> None:
+        self._spawn(self._timer())
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._tasks.clear()
+
+    def _spawn(self, coro) -> None:
+        self._tasks = [t for t in self._tasks if not t.done()]
+        self._tasks.append(asyncio.create_task(coro))
+
+    async def _timer(self) -> None:
+        while True:
+            await asyncio.sleep(TICK)
+            if self.election_due():
+                await self.run_election()
+
+    # Election, section 3.4.
+
+    async def run_election(self) -> None:
+        self.become_candidate()
+        term = self.term
+        request = {
+            "type": "RequestVote",
+            "shard": self.shard,
+            "term": term,
+            "candidate": self.id,
+            "last_index": self.last_index,
+            "last_term": self.last_term,
+        }
+        replies = await asyncio.gather(*(self.send(p, request) for p in self.peers))
+        votes = 1
+        for reply in replies:
+            if reply is None:
+                continue
+            if self.observe_term(reply["term"]):
+                return
+            votes += bool(reply.get("granted"))
+        # A heartbeat from a new leader or a newer term may have arrived meanwhile.
+        if self.role is Role.CANDIDATE and self.term == term and votes >= self.majority:
+            self.become_leader()
+
+    async def _heartbeats(self, term: int) -> None:
+        while self.role is Role.LEADER and self.term == term:
+            await asyncio.gather(*(self._replicate(p) for p in self.peers))
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+    async def _replicate(self, peer: str) -> None:
+        request = {
+            "type": "AppendEntries",
+            "shard": self.shard,
+            "term": self.term,
+            "leader": self.id,
+        }
+        reply = await self.send(peer, request)
+        if reply is not None:
+            self.observe_term(reply["term"])
+
+    # Handlers for messages from the other replicas.
+
+    def on_request_vote(self, m: Message) -> Message:
+        self.observe_term(m["term"])
+        log_ok = (m["last_term"], m["last_index"]) >= (self.last_term, self.last_index)
+        granted = m["term"] == self.term and self.voted_for in (None, m["candidate"]) and log_ok
+        if granted:
+            self.voted_for = m["candidate"]
+            self.reset_election_timer()
+        return {"type": "VoteReply", "shard": self.shard, "term": self.term, "granted": granted}
+
+    def on_append_entries(self, m: Message) -> Message:
+        self.observe_term(m["term"])
+        if m["term"] < self.term:
+            return {"type": "AppendReply", "shard": self.shard, "term": self.term, "success": False}
+        # Same term: there is exactly one leader, so a candidate gives up.
+        self.become_follower(m["leader"])
+        return {"type": "AppendReply", "shard": self.shard, "term": self.term, "success": True}
 
     def status(self) -> Message:
         return {
