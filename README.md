@@ -18,6 +18,18 @@ There is no code yet. Every goal in the table below is a GitHub issue in the mil
 | 7. or 8.12. | demo |
 | 14.12. | code, report and individual quiz |
 
+## Decisions
+
+The design plan left three questions open (section 7) and issue #1 answers them.
+
+| Question | Decision | Why |
+|---|---|---|
+| Store | SQLite through Python's `sqlite3`, one database file per storage node | Raft term, vote and log must survive a crash. SQLite gives atomic writes and needs nothing beyond the standard library |
+| Machines | the course VMs `svm-11.cs.helsinki.fi`, `svm-11-2.cs.helsinki.fi` and `svm-11-3.cs.helsinki.fi` | three separate machines with their own IP as the project description asks and the teachers can reach them |
+| Placement | a static shard map in the cluster config for the prototype | the placement service (#14) comes on top once Raft, store and router run. It also moves leaders with TimeoutNow |
+
+Each machine runs one storage node with a replica of each of the three shards. Peer and client traffic uses one TCP port per node (7100).
+
 ## Layout
 
 Every topic of the design plan has one place in the code, so the report can point to it directly.
