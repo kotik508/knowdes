@@ -22,8 +22,9 @@ from pathlib import Path
 from knowdes import config, protocol
 from knowdes.debug import EventLog
 from knowdes.protocol import Message
-from knowdes.raft import NotLeaderError, RaftGroup
+from knowdes.raft import NotLeaderError, RaftGroup, Role
 from knowdes.raft.storage import MemoryStorage, SqliteStorage, open_database
+from knowdes.store import ShardStore
 
 # Timeout for one message to another node. A heartbeat interval is 50 ms.
 PEER_TIMEOUT = 0.1
@@ -43,12 +44,14 @@ class StorageNode:
         # Without a data directory nothing survives a restart, which suits some tests.
         self.db = open_database(data_dir / f"{node_id}.db") if data_dir else None
         self.events = EventLog(node_id, data_dir / f"{node_id}-events.log" if data_dir else None)
+        self.stores = {s: ShardStore() for s in range(shards)}
         self.groups = {
             s: RaftGroup(
                 s,
                 node_id,
                 members,
                 self.send,
+                apply=lambda index, command, store=self.stores[s]: store.apply(command),
                 storage=SqliteStorage(self.db, s) if self.db else MemoryStorage(),
                 emit=self.events.emit,
             )
@@ -142,8 +145,10 @@ class StorageNode:
             return self.groups[m["shard"]].on_request_vote(m)
         if kind == "AppendEntries":
             return self.groups[m["shard"]].on_append_entries(m)
-        if kind in ("Put", "Delete"):
+        if kind in ("Put", "Delete", "BatchPut"):
             return await self.write(m)
+        if kind == "Get":
+            return self.get(m)
         return {"type": "Error", "error": f"unknown message type {kind}"}
 
     async def write(self, m: Message) -> Message:
@@ -151,7 +156,10 @@ class StorageNode:
         group = self.groups.get(m.get("shard"))
         if group is None:
             return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
-        command = {"op": m["type"].lower(), "s": m["s"], "p": m["p"], "o": m["o"]}
+        try:
+            command = write_command(m)
+        except (KeyError, TypeError, ValueError) as err:
+            return {"type": "Error", "id": m.get("id"), "error": f"bad write: {err}"}
         try:
             index = await group.propose(command)
         except NotLeaderError as err:
@@ -159,6 +167,20 @@ class StorageNode:
         except TimeoutError:
             return {"type": "Error", "id": m.get("id"), "error": "not committed in time"}
         return {"type": "Reply", "id": m.get("id"), "ok": True, "index": index}
+
+    def get(self, m: Message) -> Message:
+        """All facts about one subject, answered by the leader of its shard.
+
+        The leader answers from what it has applied. ReadIndex and follower reads
+        come with #10.
+        """
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
+        if group.role is not Role.LEADER:
+            return {"type": "Redirect", "id": m.get("id"), "leader": group.leader}
+        facts = self.stores[m["shard"]].get(m["s"])
+        return {"type": "Reply", "id": m.get("id"), "ok": True, "facts": facts}
 
     def control(self, m: Message) -> Message:
         """Pause or resume the node, cut or heal its links to other nodes."""
@@ -194,6 +216,24 @@ class StorageNode:
             "isolated": sorted(self.isolated),
             "shards": [g.status() for g in self.groups.values()],
         }
+
+
+def write_command(m: Message) -> Message:
+    """The log entry for a client write.
+
+    A fact from a source system carries the source's version (for Sisu the
+    modification ordinal). The store then ignores repeated and older versions.
+    """
+    if m["type"] == "BatchPut":
+        return {"op": "batch", "facts": [fact_command("put", f) for f in m["facts"]]}
+    return fact_command(m["type"].lower(), m)
+
+
+def fact_command(op: str, m: Message) -> Message:
+    command = {"op": op, "s": str(m["s"]), "p": str(m["p"]), "o": str(m["o"])}
+    if m.get("version") is not None:
+        command["version"] = int(m["version"])
+    return command
 
 
 def main() -> None:
