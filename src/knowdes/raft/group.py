@@ -15,6 +15,8 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from knowdes.raft.storage import MemoryStorage
+
 Message = dict[str, Any]
 Send = Callable[[str, Message], Awaitable[Message | None]]
 # Called once for every committed entry, in log order: apply(index, command).
@@ -53,6 +55,7 @@ class RaftGroup:
         members: list[str],
         send: Send,
         apply: Apply | None = None,
+        storage=None,
         rng: random.Random | None = None,
     ) -> None:
         self.shard = shard
@@ -62,11 +65,13 @@ class RaftGroup:
         self.apply = apply or (lambda index, command: None)
         self.rng = rng or random.Random()
 
-        # Persistent state in the Raft paper. Kept in memory for now.
-        self.term = 0
-        self.voted_for: str | None = None
+        # Persistent state in the Raft paper, loaded from the storage.
+        self.storage = storage or MemoryStorage()
+        term, voted_for, entries = self.storage.load()
+        self.term = term
+        self.voted_for: str | None = voted_for
         # Index 0 is a dummy entry, so the first real entry has index 1 as in the paper.
-        self.log: list[Message] = [{"term": 0, "command": None}]
+        self.log: list[Message] = [{"term": 0, "command": None}, *entries]
 
         # Volatile state.
         self.role = Role.FOLLOWER
@@ -100,6 +105,7 @@ class RaftGroup:
             return False
         self.term = term
         self.voted_for = None
+        self._save_state()
         self.become_follower(None)
         return True
 
@@ -114,6 +120,7 @@ class RaftGroup:
         self.term += 1
         self.role = Role.CANDIDATE
         self.voted_for = self.id
+        self._save_state()
         self.leader = None
         self.reset_election_timer()
 
@@ -126,7 +133,7 @@ class RaftGroup:
         self.match_index = {p: 0 for p in self.peers}
         # An empty entry of the new term lets the leader commit everything before it
         # (Raft paper, section 5.4.2).
-        self.log.append({"term": self.term, "command": None})
+        self._append_entries(self.last_index + 1, [{"term": self.term, "command": None}])
         self._spawn(self._heartbeats(self.term))
 
     @property
@@ -247,7 +254,7 @@ class RaftGroup:
         """Append a command and wait until a majority stores it. Returns its log index."""
         if self.role is not Role.LEADER:
             raise NotLeaderError(self.leader)
-        self.log.append({"term": self.term, "command": command})
+        self._append_entries(self.last_index + 1, [{"term": self.term, "command": command}])
         index = self.last_index
         waiter = asyncio.get_running_loop().create_future()
         self._waiters[index] = waiter
@@ -267,6 +274,7 @@ class RaftGroup:
         granted = m["term"] == self.term and self.voted_for in (None, m["candidate"]) and log_ok
         if granted:
             self.voted_for = m["candidate"]
+            self._save_state()
             self.reset_election_timer()
         return {"type": "VoteReply", "shard": self.shard, "term": self.term, "granted": granted}
 
@@ -282,16 +290,27 @@ class RaftGroup:
             return {**reply, "success": False, "last_index": self.last_index}
         for offset, entry in enumerate(m["entries"]):
             index = prev + 1 + offset
-            if index <= self.last_index and self.log[index]["term"] != entry["term"]:
-                # A conflicting entry and everything after it were never committed.
-                del self.log[index:]
-            if index > self.last_index:
-                self.log.append(entry)
+            if index <= self.last_index and self.log[index]["term"] == entry["term"]:
+                continue
+            # From here on the entries are new or replace a conflicting entry and
+            # everything after it, which were never committed.
+            self._append_entries(index, m["entries"][offset:])
+            break
         last_new = prev + len(m["entries"])
         if m["leader_commit"] > self.commit_index:
             self.commit_index = min(m["leader_commit"], last_new)
             self._apply_committed()
         return {**reply, "success": True, "match_index": last_new}
+
+    # Persistence. Raft requires both to be on disk before the node answers.
+
+    def _save_state(self) -> None:
+        self.storage.save_state(self.term, self.voted_for)
+
+    def _append_entries(self, index: int, entries: list[Message]) -> None:
+        self.storage.append(index, entries)
+        del self.log[index:]
+        self.log.extend(entries)
 
     def status(self) -> Message:
         return {

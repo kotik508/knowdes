@@ -13,10 +13,12 @@ import argparse
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 
 from knowdes import protocol
 from knowdes.protocol import Message
 from knowdes.raft import NotLeaderError, RaftGroup
+from knowdes.raft.storage import MemoryStorage, SqliteStorage, open_database
 
 # Timeout for one message to another node. A heartbeat interval is 50 ms.
 PEER_TIMEOUT = 0.1
@@ -28,11 +30,23 @@ class StorageNode:
         node_id: str,
         addresses: dict[str, tuple[str, int]],
         shards: int = 3,
+        data_dir: Path | None = None,
     ) -> None:
         self.id = node_id
         self.addresses = addresses
         members = sorted(addresses)
-        self.groups = {s: RaftGroup(s, node_id, members, self.send) for s in range(shards)}
+        # Without a data directory nothing survives a restart, which suits some tests.
+        self.db = open_database(data_dir / f"{node_id}.db") if data_dir else None
+        self.groups = {
+            s: RaftGroup(
+                s,
+                node_id,
+                members,
+                self.send,
+                storage=SqliteStorage(self.db, s) if self.db else MemoryStorage(),
+            )
+            for s in range(shards)
+        }
         self.server: asyncio.Server | None = None
 
     async def send(self, peer: str, msg: Message) -> Message | None:
@@ -55,6 +69,8 @@ class StorageNode:
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
+        if self.db is not None:
+            self.db.close()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -113,6 +129,7 @@ def main() -> None:
     parser.add_argument("--listen", required=True, help="host:port of this node")
     parser.add_argument("--peer", action="append", default=[], help="id=host:port")
     parser.add_argument("--shards", type=int, default=3)
+    parser.add_argument("--data-dir", type=Path, help="keep term, vote and log here")
     args = parser.parse_args()
 
     addresses = {args.id: protocol.parse_address(args.listen)}
@@ -121,7 +138,7 @@ def main() -> None:
         addresses[peer_id] = protocol.parse_address(address)
 
     async def run() -> None:
-        node = StorageNode(args.id, addresses, args.shards)
+        node = StorageNode(args.id, addresses, args.shards, args.data_dir)
         await node.start()
         try:
             await asyncio.Event().wait()
