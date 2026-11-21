@@ -21,6 +21,8 @@ Message = dict[str, Any]
 Send = Callable[[str, Message], Awaitable[Message | None]]
 # Called once for every committed entry, in log order: apply(index, command).
 Apply = Callable[[int, Message | None], None]
+# Reports an event for the log file and the console: emit(kind, shard, **details).
+Emit = Callable[..., Any]
 
 # Range of the random election timeout and the heartbeat interval, section 3.4.
 ELECTION_TIMEOUT = (0.15, 0.30)
@@ -56,6 +58,7 @@ class RaftGroup:
         send: Send,
         apply: Apply | None = None,
         storage=None,
+        emit: Emit | None = None,
         rng: random.Random | None = None,
     ) -> None:
         self.shard = shard
@@ -63,6 +66,7 @@ class RaftGroup:
         self.peers = [m for m in members if m != node_id]
         self.send = send
         self.apply = apply or (lambda index, command: None)
+        self._emit = emit or (lambda kind, shard, **details: None)
         self.rng = rng or random.Random()
 
         # Persistent state in the Raft paper, loaded from the storage.
@@ -112,6 +116,8 @@ class RaftGroup:
     def become_follower(self, leader: str | None) -> None:
         if self.role is Role.LEADER:
             self._fail_waiters(leader)
+        if self.role is not Role.FOLLOWER or self.leader != leader:
+            self.event("follower", leader=leader)
         self.role = Role.FOLLOWER
         self.leader = leader
         self.reset_election_timer()
@@ -122,6 +128,7 @@ class RaftGroup:
         self.voted_for = self.id
         self._save_state()
         self.leader = None
+        self.event("election")
         self.reset_election_timer()
 
     def become_leader(self) -> None:
@@ -129,6 +136,7 @@ class RaftGroup:
             raise RuntimeError("only a candidate can become leader")
         self.role = Role.LEADER
         self.leader = self.id
+        self.event("leader")
         self.next_index = {p: self.last_index + 1 for p in self.peers}
         self.match_index = {p: 0 for p in self.peers}
         # An empty entry of the new term lets the leader commit everything before it
@@ -231,6 +239,7 @@ class RaftGroup:
             # Only entries of the current term are committed by counting (section 5.4.2).
             if stored >= self.majority and self.log[index]["term"] == self.term:
                 self.commit_index = index
+                self.event("commit", replicas=stored)
                 self._apply_committed()
                 return
 
@@ -275,6 +284,7 @@ class RaftGroup:
         if granted:
             self.voted_for = m["candidate"]
             self._save_state()
+            self.event("vote", candidate=m["candidate"])
             self.reset_election_timer()
         return {"type": "VoteReply", "shard": self.shard, "term": self.term, "granted": granted}
 
@@ -301,6 +311,9 @@ class RaftGroup:
             self.commit_index = min(m["leader_commit"], last_new)
             self._apply_committed()
         return {**reply, "success": True, "match_index": last_new}
+
+    def event(self, kind: str, **details: Any) -> None:
+        self._emit(kind, self.shard, term=self.term, index=self.commit_index, **details)
 
     # Persistence. Raft requires both to be on disk before the node answers.
 

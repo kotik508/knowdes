@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from knowdes import protocol
+from knowdes.debug import EventLog
 from knowdes.protocol import Message
 from knowdes.raft import NotLeaderError, RaftGroup
 from knowdes.raft.storage import MemoryStorage, SqliteStorage, open_database
@@ -37,6 +38,7 @@ class StorageNode:
         members = sorted(addresses)
         # Without a data directory nothing survives a restart, which suits some tests.
         self.db = open_database(data_dir / f"{node_id}.db") if data_dir else None
+        self.events = EventLog(node_id, data_dir / f"{node_id}-events.log" if data_dir else None)
         self.groups = {
             s: RaftGroup(
                 s,
@@ -44,6 +46,7 @@ class StorageNode:
                 members,
                 self.send,
                 storage=SqliteStorage(self.db, s) if self.db else MemoryStorage(),
+                emit=self.events.emit,
             )
             for s in range(shards)
         }
@@ -71,13 +74,18 @@ class StorageNode:
             await self.server.wait_closed()
         if self.db is not None:
             self.db.close()
+        self.events.close()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             line = await reader.readline()
             if not line:
                 return
-            reply = await self.handle(protocol.decode(line))
+            msg = protocol.decode(line)
+            if msg["type"] == "Subscribe":
+                await self.stream_events(msg, reader, writer)
+                return
+            reply = await self.handle(msg)
             if reply is not None:
                 writer.write(protocol.encode(reply))
                 await writer.drain()
@@ -88,6 +96,29 @@ class StorageNode:
             pass
         finally:
             writer.close()
+
+    async def stream_events(
+        self, m: Message, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Push every event to the subscriber until it closes the connection."""
+        queue = self.events.subscribe(m.get("shards"))
+        closed = asyncio.create_task(reader.read())
+        try:
+            writer.write(protocol.encode({"type": "Subscribed", "node": self.id}))
+            await writer.drain()
+            while True:
+                next_event = asyncio.create_task(queue.get())
+                done, _ = await asyncio.wait(
+                    {next_event, closed}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if closed in done:
+                    next_event.cancel()
+                    return
+                writer.write(protocol.encode(next_event.result()))
+                await writer.drain()
+        finally:
+            closed.cancel()
+            self.events.unsubscribe(queue)
 
     async def handle(self, m: Message) -> Message | None:
         kind = m["type"]
