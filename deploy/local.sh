@@ -1,5 +1,5 @@
 #!/bin/sh
-# Three nodes on this computer, from deploy/local.toml.
+# Three nodes and a router on this computer, from deploy/local.toml.
 #   deploy/local.sh start | stop | status
 set -eu
 CONFIG=deploy/local.toml
@@ -14,9 +14,14 @@ start)
         .venv/bin/python -m knowdes.node --config "$CONFIG" --id "$id" >> "data/$id.out" 2>&1 &
         echo $! > "data/$id.pid"
         echo "$id on $host:$port, pid $!"
-    done ;;
+    done
+    if ! { [ -f data/router.pid ] && kill -0 "$(cat data/router.pid)" 2>/dev/null; }; then
+        .venv/bin/python -m knowdes.router --config "$CONFIG" >> data/router.out 2>&1 &
+        echo $! > data/router.pid
+        echo "router on 127.0.0.1:7110, pid $!"
+    fi ;;
 stop)
-    for pidfile in data/n*.pid; do
+    for pidfile in data/n*.pid data/router.pid; do
         [ -f "$pidfile" ] || continue
         kill "$(cat "$pidfile")" 2>/dev/null || true
         rm "$pidfile"

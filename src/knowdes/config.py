@@ -12,6 +12,11 @@ class Cluster:
     nodes: dict[str, tuple[str, int]]
     shards: int
     data_dir: Path | None
+    # Every machine runs a router next to its storage node on this port (#7).
+    router_port: int = 7110
+
+    def routers(self) -> list[tuple[str, int]]:
+        return sorted({(host, self.router_port) for host, _ in self.nodes.values()})
 
 
 def load(path: Path) -> Cluster:
@@ -27,6 +32,7 @@ def load(path: Path) -> Cluster:
         nodes=nodes,
         shards=int(raw.get("shards", 3)),
         data_dir=Path(data_dir).expanduser() if data_dir else None,
+        router_port=int(raw.get("router_port", 7110)),
     )
 
 
