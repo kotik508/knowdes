@@ -8,7 +8,7 @@ The full design is in [docs/design-plan.pdf](docs/design-plan.pdf).
 
 ## Status
 
-The first goal is reached. Every storage node runs one Raft group per shard with election, log replication and a log in SQLite. Each node also answers Subscribe and Control. Every goal in the table below is a GitHub issue in the milestone with the same date.
+Every storage node runs one Raft group per shard with election, log replication, a log in SQLite and fast catch-up after a restart. Each node also answers Subscribe and Control. Each shard keeps its facts and the reverse edges of its objects. A router takes Put, Delete, BatchPut, Get and Neighbors without the client knowing about shards, with leader reads (ReadIndex) or follower reads, and the CLI talks to it. Of the goals until 29.11. only the console is missing, its plan is in `docs/console-plan.md` for the group to agree on. Every goal in the table below is a GitHub issue in the milestone with the same date.
 
 | Until | Goal |
 |---|---|
@@ -62,7 +62,7 @@ deploy/local.sh start   # three nodes here, data and logs in data/
 deploy/local.sh status
 deploy/local.sh stop
 
-deploy/start.sh         # one node on every course machine over ssh
+deploy/start.sh         # one node and one router on every course machine over ssh
 deploy/stop.sh
 ```
 
@@ -73,6 +73,17 @@ Host svm-11.cs.helsinki.fi svm-11-2.cs.helsinki.fi svm-11-3.cs.helsinki.fi
     User YOUR_UNI_USERNAME
     ProxyJump YOUR_UNI_USERNAME@melkki.cs.helsinki.fi
 ```
+
+`deploy/local.sh start` also starts a router on port 7110, the CLI talks to it:
+
+```sh
+uv run knowdes put CSM13001 teacher niklander
+uv run knowdes get CSM13001 --read follower
+uv run knowdes neighbors niklander --direction in --depth 2
+uv run knowdes delete CSM13001 teacher niklander
+```
+
+A plain write adds the reverse edge on the shard of the object as a second write, which becomes atomic with two-phase commit (#12). Facts with a source version get no reverse edge until then, because a newer version replaces the old value and its old reverse edge would stay behind.
 
 Until the console exists a node can be watched and disturbed from the command line:
 
