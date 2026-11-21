@@ -39,3 +39,24 @@ def test_batch_and_noop_entries():
     store.apply({"op": "batch", "facts": [put("a", "p", "1"), put("b", "p", "2")]})
     assert store.get("a") == {"p": ["1"]}
     assert store.get("b") == {"p": ["2"]}
+
+
+def test_reverse_edges_are_kept_apart_from_facts():
+    store = ShardStore()
+    store.apply({"op": "rput", "s": "CSM13001", "p": "teacher", "o": "niklander"})
+    store.apply({"op": "rput", "s": "CSM14204", "p": "teacher", "o": "niklander"})
+    assert store.get("niklander") == {}
+    assert store.incoming("niklander") == {"teacher": ["CSM13001", "CSM14204"]}
+    store.apply({"op": "rdelete", "s": "CSM14204", "p": "teacher", "o": "niklander"})
+    assert store.incoming("niklander") == {"teacher": ["CSM13001"]}
+    store.apply({"op": "rdelete", "s": "CSM13001", "p": "teacher", "o": "niklander"})
+    assert store.incoming("niklander") == {}
+    assert store.into == {}
+
+
+def test_deleting_the_last_object_removes_the_subject():
+    store = ShardStore()
+    store.apply(put("a", "p", "1"))
+    store.apply({"op": "delete", "s": "a", "p": "p", "o": "1"})
+    store.apply({"op": "delete", "s": "missing", "p": "p", "o": "1"})
+    assert store.out == {}
