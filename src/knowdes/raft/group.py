@@ -17,10 +17,14 @@ from typing import Any
 
 Message = dict[str, Any]
 Send = Callable[[str, Message], Awaitable[Message | None]]
+# Called once for every committed entry, in log order: apply(index, command).
+Apply = Callable[[int, Message | None], None]
 
 # Range of the random election timeout and the heartbeat interval, section 3.4.
 ELECTION_TIMEOUT = (0.15, 0.30)
 HEARTBEAT_INTERVAL = 0.05
+# How long a client write waits for its entry to be committed.
+COMMIT_TIMEOUT = 1.0
 # How often the timer loop looks at the election deadline.
 TICK = 0.01
 
@@ -29,6 +33,14 @@ class Role(enum.StrEnum):
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
     LEADER = "leader"
+
+
+class NotLeaderError(Exception):
+    """Raised for a client write at a replica that is not the leader."""
+
+    def __init__(self, leader: str | None) -> None:
+        super().__init__(f"not the leader, leader is {leader}")
+        self.leader = leader
 
 
 class RaftGroup:
@@ -40,23 +52,33 @@ class RaftGroup:
         node_id: str,
         members: list[str],
         send: Send,
+        apply: Apply | None = None,
         rng: random.Random | None = None,
     ) -> None:
         self.shard = shard
         self.id = node_id
         self.peers = [m for m in members if m != node_id]
         self.send = send
+        self.apply = apply or (lambda index, command: None)
         self.rng = rng or random.Random()
 
         # Persistent state in the Raft paper. Kept in memory for now.
         self.term = 0
         self.voted_for: str | None = None
+        # Index 0 is a dummy entry, so the first real entry has index 1 as in the paper.
+        self.log: list[Message] = [{"term": 0, "command": None}]
 
         # Volatile state.
         self.role = Role.FOLLOWER
         self.leader: str | None = None
         self.deadline = 0.0
         self.reset_election_timer()
+        self.commit_index = 0
+        self.last_applied = 0
+        # Leader only: next entry to send and highest entry known to be stored, per peer.
+        self.next_index: dict[str, int] = {}
+        self.match_index: dict[str, int] = {}
+        self._waiters: dict[int, asyncio.Future] = {}
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -82,6 +104,8 @@ class RaftGroup:
         return True
 
     def become_follower(self, leader: str | None) -> None:
+        if self.role is Role.LEADER:
+            self._fail_waiters(leader)
         self.role = Role.FOLLOWER
         self.leader = leader
         self.reset_election_timer()
@@ -98,15 +122,20 @@ class RaftGroup:
             raise RuntimeError("only a candidate can become leader")
         self.role = Role.LEADER
         self.leader = self.id
+        self.next_index = {p: self.last_index + 1 for p in self.peers}
+        self.match_index = {p: 0 for p in self.peers}
+        # An empty entry of the new term lets the leader commit everything before it
+        # (Raft paper, section 5.4.2).
+        self.log.append({"term": self.term, "command": None})
         self._spawn(self._heartbeats(self.term))
 
     @property
     def last_index(self) -> int:
-        return 0
+        return len(self.log) - 1
 
     @property
     def last_term(self) -> int:
-        return 0
+        return self.log[-1]["term"]
 
     # Timer and background tasks.
 
@@ -162,15 +191,73 @@ class RaftGroup:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def _replicate(self, peer: str) -> None:
+        """Send the entries the peer is missing. Without missing entries it is a heartbeat."""
+        term = self.term
+        prev = self.next_index[peer] - 1
         request = {
             "type": "AppendEntries",
             "shard": self.shard,
-            "term": self.term,
+            "term": term,
             "leader": self.id,
+            "prev_index": prev,
+            "prev_term": self.log[prev]["term"],
+            "entries": self.log[prev + 1 :],
+            "leader_commit": self.commit_index,
         }
         reply = await self.send(peer, request)
-        if reply is not None:
-            self.observe_term(reply["term"])
+        if reply is None or self.observe_term(reply["term"]):
+            return
+        if self.role is not Role.LEADER or self.term != term:
+            return
+        if reply["success"]:
+            match = prev + len(request["entries"])
+            self.match_index[peer] = max(self.match_index[peer], match)
+            self.next_index[peer] = self.match_index[peer] + 1
+            self._advance_commit()
+        else:
+            # The logs differ at prev. Step back one entry and try again next time.
+            self.next_index[peer] = max(1, prev)
+
+    def _advance_commit(self) -> None:
+        for index in range(self.last_index, self.commit_index, -1):
+            stored = 1 + sum(m >= index for m in self.match_index.values())
+            # Only entries of the current term are committed by counting (section 5.4.2).
+            if stored >= self.majority and self.log[index]["term"] == self.term:
+                self.commit_index = index
+                self._apply_committed()
+                return
+
+    def _apply_committed(self) -> None:
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            self.apply(self.last_applied, self.log[self.last_applied]["command"])
+            waiter = self._waiters.pop(self.last_applied, None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(self.last_applied)
+
+    def _fail_waiters(self, leader: str | None) -> None:
+        for waiter in self._waiters.values():
+            if not waiter.done():
+                waiter.set_exception(NotLeaderError(leader))
+        self._waiters.clear()
+
+    # Client writes.
+
+    async def propose(self, command: Message) -> int:
+        """Append a command and wait until a majority stores it. Returns its log index."""
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader)
+        self.log.append({"term": self.term, "command": command})
+        index = self.last_index
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters[index] = waiter
+        # Do not wait for the next heartbeat.
+        await asyncio.gather(*(self._replicate(p) for p in self.peers))
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiter), COMMIT_TIMEOUT)
+        except TimeoutError:
+            self._waiters.pop(index, None)
+            raise
 
     # Handlers for messages from the other replicas.
 
@@ -189,7 +276,22 @@ class RaftGroup:
             return {"type": "AppendReply", "shard": self.shard, "term": self.term, "success": False}
         # Same term: there is exactly one leader, so a candidate gives up.
         self.become_follower(m["leader"])
-        return {"type": "AppendReply", "shard": self.shard, "term": self.term, "success": True}
+        reply = {"type": "AppendReply", "shard": self.shard, "term": self.term}
+        prev = m["prev_index"]
+        if prev > self.last_index or self.log[prev]["term"] != m["prev_term"]:
+            return {**reply, "success": False, "last_index": self.last_index}
+        for offset, entry in enumerate(m["entries"]):
+            index = prev + 1 + offset
+            if index <= self.last_index and self.log[index]["term"] != entry["term"]:
+                # A conflicting entry and everything after it were never committed.
+                del self.log[index:]
+            if index > self.last_index:
+                self.log.append(entry)
+        last_new = prev + len(m["entries"])
+        if m["leader_commit"] > self.commit_index:
+            self.commit_index = min(m["leader_commit"], last_new)
+            self._apply_committed()
+        return {**reply, "success": True, "match_index": last_new}
 
     def status(self) -> Message:
         return {
@@ -197,4 +299,6 @@ class RaftGroup:
             "role": str(self.role),
             "term": self.term,
             "leader": self.leader,
+            "last_index": self.last_index,
+            "commit_index": self.commit_index,
         }

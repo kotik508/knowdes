@@ -16,7 +16,7 @@ import json
 
 from knowdes import protocol
 from knowdes.protocol import Message
-from knowdes.raft import RaftGroup
+from knowdes.raft import NotLeaderError, RaftGroup
 
 # Timeout for one message to another node. A heartbeat interval is 50 ms.
 PEER_TIMEOUT = 0.1
@@ -79,9 +79,25 @@ class StorageNode:
             return self.groups[m["shard"]].on_request_vote(m)
         if kind == "AppendEntries":
             return self.groups[m["shard"]].on_append_entries(m)
+        if kind in ("Put", "Delete"):
+            return await self.write(m)
         if kind == "Status":
             return self.status()
         return {"type": "Error", "error": f"unknown message type {kind}"}
+
+    async def write(self, m: Message) -> Message:
+        """A client write. Until the router exists (#7) the client names the shard itself."""
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
+        command = {"op": m["type"].lower(), "s": m["s"], "p": m["p"], "o": m["o"]}
+        try:
+            index = await group.propose(command)
+        except NotLeaderError as err:
+            return {"type": "Redirect", "id": m.get("id"), "leader": err.leader}
+        except TimeoutError:
+            return {"type": "Error", "id": m.get("id"), "error": "not committed in time"}
+        return {"type": "Reply", "id": m.get("id"), "ok": True, "index": index}
 
     def status(self) -> Message:
         return {
