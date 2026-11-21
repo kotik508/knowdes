@@ -288,6 +288,36 @@ class RaftGroup:
             self._waiters.pop(index, None)
             raise
 
+    # Reads, section 3.3 (#10).
+
+    async def read_index(self) -> int:
+        """The index a leader read has to wait for (ReadIndex, Raft thesis section 6.4).
+
+        A leader cut off from the others still thinks it leads. Before it answers it
+        checks with one round of heartbeats that a majority still follows it, and it
+        only counts once it has committed an entry of its own term.
+        """
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader)
+        term = self.term
+        loop = asyncio.get_running_loop()
+        end = loop.time() + COMMIT_TIMEOUT
+        while self.log[self.commit_index]["term"] != term:
+            if self.role is not Role.LEADER or self.term != term:
+                raise NotLeaderError(self.leader)
+            if loop.time() > end:
+                raise TimeoutError
+            await asyncio.sleep(TICK)
+        index = self.commit_index
+        acks = await asyncio.gather(*(self._replicate(p) for p in self.peers))
+        if self.role is not Role.LEADER or self.term != term:
+            raise NotLeaderError(self.leader)
+        if 1 + sum(acks) < self.majority:
+            raise TimeoutError
+        while self.last_applied < index:
+            await asyncio.sleep(TICK)
+        return index
+
     # Handlers for messages from the other replicas.
 
     def on_request_vote(self, m: Message) -> Message:
@@ -359,4 +389,5 @@ class RaftGroup:
             "leader": self.leader,
             "last_index": self.last_index,
             "commit_index": self.commit_index,
+            "last_applied": self.last_applied,
         }

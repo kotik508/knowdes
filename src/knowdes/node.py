@@ -22,7 +22,7 @@ from pathlib import Path
 from knowdes import config, protocol
 from knowdes.debug import EventLog
 from knowdes.protocol import Message
-from knowdes.raft import NotLeaderError, RaftGroup, Role
+from knowdes.raft import NotLeaderError, RaftGroup
 from knowdes.raft.storage import MemoryStorage, SqliteStorage, open_database
 from knowdes.store import ShardStore
 
@@ -148,7 +148,7 @@ class StorageNode:
         if kind in ("Put", "Delete", "BatchPut"):
             return await self.write(m)
         if kind == "Get":
-            return self.get(m)
+            return await self.get(m)
         return {"type": "Error", "error": f"unknown message type {kind}"}
 
     async def write(self, m: Message) -> Message:
@@ -168,19 +168,38 @@ class StorageNode:
             return {"type": "Error", "id": m.get("id"), "error": "not committed in time"}
         return {"type": "Reply", "id": m.get("id"), "ok": True, "index": index}
 
-    def get(self, m: Message) -> Message:
-        """All facts about one subject, answered by the leader of its shard.
+    async def get(self, m: Message) -> Message:
+        """Edges of one node in both directions, at one of two read levels (#10).
 
-        The leader answers from what it has applied. ReadIndex and follower reads
-        come with #10.
+        read "leader": only the leader answers, after ReadIndex has confirmed that a
+        majority still follows it, so the answer contains every committed write.
+        read "follower": any replica answers from what it has applied. It may miss
+        the newest writes, the reply says up to which log index it is.
         """
         group = self.groups.get(m.get("shard"))
         if group is None:
             return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
-        if group.role is not Role.LEADER:
-            return {"type": "Redirect", "id": m.get("id"), "leader": group.leader}
-        facts = self.stores[m["shard"]].get(m["s"])
-        return {"type": "Reply", "id": m.get("id"), "ok": True, "facts": facts}
+        level = m.get("read", "leader")
+        if level == "leader":
+            try:
+                await group.read_index()
+            except NotLeaderError as err:
+                return {"type": "Redirect", "id": m.get("id"), "leader": err.leader}
+            except TimeoutError:
+                return {"type": "Error", "id": m.get("id"), "error": "leadership not confirmed"}
+        elif level != "follower":
+            return {"type": "Error", "id": m.get("id"), "error": f"unknown read level {level}"}
+        store = self.stores[m["shard"]]
+        return {
+            "type": "Reply",
+            "id": m.get("id"),
+            "ok": True,
+            "node": self.id,
+            "read": level,
+            "applied": group.last_applied,
+            "facts": store.get(m["s"]),
+            "incoming": store.incoming(m["s"]),
+        }
 
     def control(self, m: Message) -> Message:
         """Pause or resume the node, cut or heal its links to other nodes."""
@@ -225,11 +244,14 @@ def write_command(m: Message) -> Message:
     modification ordinal). The store then ignores repeated and older versions.
     """
     if m["type"] == "BatchPut":
-        return {"op": "batch", "facts": [fact_command("put", f) for f in m["facts"]]}
+        return {"op": "batch", "facts": [fact_command(f.get("op", "put"), f) for f in m["facts"]]}
     return fact_command(m["type"].lower(), m)
 
 
 def fact_command(op: str, m: Message) -> Message:
+    # A reverse edge lives on the shard of its object (#6).
+    if m.get("reverse"):
+        op = "r" + op
     command = {"op": op, "s": str(m["s"]), "p": str(m["p"]), "o": str(m["o"])}
     if m.get("version") is not None:
         command["version"] = int(m["version"])
