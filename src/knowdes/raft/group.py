@@ -208,8 +208,11 @@ class RaftGroup:
                 await asyncio.gather(*(self._replicate(p) for p in self.peers))
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-    async def _replicate(self, peer: str) -> None:
-        """Send the entries the peer is missing. Without missing entries it is a heartbeat."""
+    async def _replicate(self, peer: str) -> bool:
+        """Send the entries the peer is missing. Without missing entries it is a heartbeat.
+
+        Returns True when the peer answered in this term, so it still takes us as leader.
+        """
         term = self.term
         prev = self.next_index[peer] - 1
         request = {
@@ -224,17 +227,24 @@ class RaftGroup:
         }
         reply = await self.send(peer, request)
         if reply is None or self.observe_term(reply["term"]):
-            return
+            return False
         if self.role is not Role.LEADER or self.term != term:
-            return
+            return False
         if reply["success"]:
             match = prev + len(request["entries"])
             self.match_index[peer] = max(self.match_index[peer], match)
             self.next_index[peer] = self.match_index[peer] + 1
             self._advance_commit()
-        else:
-            # The logs differ at prev. Step back one entry and try again next time.
-            self.next_index[peer] = max(1, prev)
+            return True
+        # The logs differ at prev. A follower that was down reports where its log ends
+        # and where its entries of the conflicting term start, so the leader jumps there
+        # at once instead of stepping back one entry per heartbeat (#9).
+        back = min(prev, reply.get("last_index", prev - 1) + 1, reply.get("conflict_index", prev))
+        self.next_index[peer] = max(1, back)
+        # Send the missing entries now and not with the next heartbeat.
+        if self.next_index[peer] < prev:
+            return await self._replicate(peer)
+        return True
 
     def _advance_commit(self) -> None:
         for index in range(self.last_index, self.commit_index, -1):
@@ -299,8 +309,19 @@ class RaftGroup:
         self.become_follower(m["leader"])
         reply = {"type": "AppendReply", "shard": self.shard, "term": self.term}
         prev = m["prev_index"]
-        if prev > self.last_index or self.log[prev]["term"] != m["prev_term"]:
+        if prev > self.last_index:
             return {**reply, "success": False, "last_index": self.last_index}
+        if self.log[prev]["term"] != m["prev_term"]:
+            # Everything of the conflicting term is suspect, so name where it starts.
+            conflict, conflict_term = prev, self.log[prev]["term"]
+            while conflict > 1 and self.log[conflict - 1]["term"] == conflict_term:
+                conflict -= 1
+            return {
+                **reply,
+                "success": False,
+                "last_index": self.last_index,
+                "conflict_index": conflict,
+            }
         for offset, entry in enumerate(m["entries"]):
             index = prev + 1 + offset
             if index <= self.last_index and self.log[index]["term"] == entry["term"]:
@@ -310,8 +331,10 @@ class RaftGroup:
             self._append_entries(index, m["entries"][offset:])
             break
         last_new = prev + len(m["entries"])
-        if m["leader_commit"] > self.commit_index:
-            self.commit_index = min(m["leader_commit"], last_new)
+        # A heartbeat may carry fewer entries than we have, never step the commit back.
+        commit = min(m["leader_commit"], last_new)
+        if commit > self.commit_index:
+            self.commit_index = commit
             self._apply_committed()
         return {**reply, "success": True, "match_index": last_new}
 
