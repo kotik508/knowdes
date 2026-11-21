@@ -16,7 +16,3 @@ Every piece of work is an issue with one person assigned and a milestone (22.11.
 - Use clear names. Write a comment where the reason for the code is not obvious.
 - Every module starts with a docstring that says which part of the design plan it implements.
 - Format and lint with `uv run ruff format` and `uv run ruff check` before you push.
-
-## AI usage
-
-The final report needs a description of how we used AI tools, with prompts where AI produced code or text. If you use AI for something in this repository, add a short entry to `docs/ai-usage.md` in the same pull request: what, which tool and the prompt.
