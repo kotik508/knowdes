@@ -17,15 +17,19 @@ def free_port() -> int:
 
 
 class LocalCluster:
-    def __init__(self, ids=("n1", "n2", "n3"), shards=3):
+    def __init__(self, ids=("n1", "n2", "n3"), shards=3, data_dir=None):
         self.ports = {i: free_port() for i in ids}
         self.shards = shards
+        self.data_dir = data_dir
         self.procs: dict[str, subprocess.Popen] = {}
 
     def args(self, node_id):
         peers = [f"--peer={i}=127.0.0.1:{p}" for i, p in self.ports.items() if i != node_id]
         listen = f"127.0.0.1:{self.ports[node_id]}"
-        return ["--id", node_id, "--listen", listen, "--shards", str(self.shards), *peers]
+        args = ["--id", node_id, "--listen", listen, "--shards", str(self.shards), *peers]
+        if self.data_dir is not None:
+            args += ["--data-dir", str(self.data_dir)]
+        return args
 
     def start(self, node_id=None):
         for i in [node_id] if node_id else list(self.ports):
@@ -33,7 +37,9 @@ class LocalCluster:
             self.procs[i] = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
 
     def kill(self, node_id):
-        self.procs.pop(node_id).kill()
+        proc = self.procs.pop(node_id)
+        proc.kill()
+        proc.wait()
 
     def stop(self):
         for proc in self.procs.values():
