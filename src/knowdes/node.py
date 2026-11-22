@@ -3,6 +3,10 @@
 The node listens on one TCP port for messages from the other nodes and from
 clients and hands each message to the Raft group of its shard.
 
+    python -m knowdes.node --config deploy/cluster.toml --id n1
+
+or without a config file
+
     python -m knowdes.node --id n1 --listen 127.0.0.1:7101 \\
         --peer n2=127.0.0.1:7102 --peer n3=127.0.0.1:7103
 """
@@ -15,7 +19,7 @@ import contextlib
 import json
 from pathlib import Path
 
-from knowdes import protocol
+from knowdes import config, protocol
 from knowdes.debug import EventLog
 from knowdes.protocol import Message
 from knowdes.raft import NotLeaderError, RaftGroup
@@ -195,19 +199,36 @@ class StorageNode:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one knowdes storage node.")
     parser.add_argument("--id", required=True)
-    parser.add_argument("--listen", required=True, help="host:port of this node")
+    parser.add_argument("--config", type=Path, help="cluster config, see deploy/")
+    parser.add_argument("--listen", help="host:port of this node")
     parser.add_argument("--peer", action="append", default=[], help="id=host:port")
-    parser.add_argument("--shards", type=int, default=3)
+    parser.add_argument("--shards", type=int)
     parser.add_argument("--data-dir", type=Path, help="keep term, vote and log here")
     args = parser.parse_args()
 
-    addresses = {args.id: protocol.parse_address(args.listen)}
+    if args.config:
+        cluster = config.load(args.config)
+        if args.id not in cluster.nodes:
+            parser.error(f"{args.id} is not in {args.config}")
+        addresses = dict(cluster.nodes)
+        shards = args.shards or cluster.shards
+        data_dir = args.data_dir or cluster.data_dir
+    else:
+        if not args.listen:
+            parser.error("give --config or --listen")
+        addresses = {args.id: protocol.parse_address(args.listen)}
+        shards = args.shards or 3
+        data_dir = args.data_dir
     for peer in args.peer:
         peer_id, _, address = peer.partition("=")
         addresses[peer_id] = protocol.parse_address(address)
+    host, port = addresses[args.id]
+    if args.config and host not in ("127.0.0.1", "localhost"):
+        # On a course machine listen on every interface, as the name may not resolve locally.
+        addresses[args.id] = ("0.0.0.0", port)
 
     async def run() -> None:
-        node = StorageNode(args.id, addresses, args.shards, args.data_dir)
+        node = StorageNode(args.id, addresses, shards, data_dir)
         await node.start()
         try:
             await asyncio.Event().wait()

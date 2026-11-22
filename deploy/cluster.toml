@@ -1,0 +1,15 @@
+# The three course machines, one storage node each (README, decisions).
+shards = 3
+data_dir = "~/knowdes/data"
+
+[nodes.n1]
+host = "svm-11.cs.helsinki.fi"
+port = 7100
+
+[nodes.n2]
+host = "svm-11-2.cs.helsinki.fi"
+port = 7100
+
+[nodes.n3]
+host = "svm-11-3.cs.helsinki.fi"
+port = 7100

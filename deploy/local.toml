@@ -1,0 +1,15 @@
+# Three nodes on one computer, for trying things out.
+shards = 3
+data_dir = "data"
+
+[nodes.n1]
+host = "127.0.0.1"
+port = 7101
+
+[nodes.n2]
+host = "127.0.0.1"
+port = 7102
+
+[nodes.n3]
+host = "127.0.0.1"
+port = 7103
