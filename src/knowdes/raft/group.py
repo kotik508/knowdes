@@ -88,6 +88,8 @@ class RaftGroup:
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
         self._waiters: dict[int, asyncio.Future] = {}
+        # A paused replica neither starts elections nor sends heartbeats (Control, section 5).
+        self.paused = False
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -172,7 +174,7 @@ class RaftGroup:
     async def _timer(self) -> None:
         while True:
             await asyncio.sleep(TICK)
-            if self.election_due():
+            if not self.paused and self.election_due():
                 await self.run_election()
 
     # Election, section 3.4.
@@ -202,7 +204,8 @@ class RaftGroup:
 
     async def _heartbeats(self, term: int) -> None:
         while self.role is Role.LEADER and self.term == term:
-            await asyncio.gather(*(self._replicate(p) for p in self.peers))
+            if not self.paused:
+                await asyncio.gather(*(self._replicate(p) for p in self.peers))
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def _replicate(self, peer: str) -> None:

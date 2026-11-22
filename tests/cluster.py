@@ -61,14 +61,20 @@ class LocalCluster:
         return result
 
     async def leaders(self):
-        """Leader of every shard as the running nodes see it, None while unclear."""
+        """Leader of every shard, None while unclear.
+
+        A cut-off old leader still thinks it leads, so the leader of the highest term counts.
+        """
         status = await self.status()
         found = {}
         for shard in range(self.shards):
-            leaders = {
-                node for node, st in status.items() if st["shards"][shard]["role"] == "leader"
-            }
-            found[shard] = leaders.pop() if len(leaders) == 1 else None
+            claims = sorted(
+                (st["shards"][shard]["term"], node)
+                for node, st in status.items()
+                if st["shards"][shard]["role"] == "leader"
+            )
+            unique = claims and (len(claims) == 1 or claims[-1][0] > claims[-2][0])
+            found[shard] = claims[-1][1] if unique else None
         return found
 
     async def wait_for_leaders(self, timeout=5.0, avoid=None):
@@ -84,7 +90,17 @@ class LocalCluster:
     async def put(self, shard, s, p="p", o="o"):
         """Write through any node and follow one redirect, like the router will."""
         msg = {"type": "Put", "shard": shard, "s": s, "p": p, "o": o}
-        reply = await self.request(next(iter(self.procs)), msg)
-        if reply["type"] == "Redirect":
-            reply = await self.request(reply["leader"], msg)
+        reply = None
+        for node in self.procs:
+            try:
+                reply = await self.request(node, msg)
+            except (OSError, TimeoutError, ValueError):
+                continue  # a paused node closes the connection without an answer
+            if reply["type"] == "Redirect":
+                reply = await self.request(reply["leader"], msg)
+            if reply.get("ok"):
+                return reply
         return reply
+
+    async def control(self, node_id, action, peers=None):
+        return await self.request(node_id, {"type": "Control", "action": action, "peers": peers})

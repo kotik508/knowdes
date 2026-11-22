@@ -51,9 +51,14 @@ class StorageNode:
             for s in range(shards)
         }
         self.server: asyncio.Server | None = None
+        # Fault injection through Control messages, for the console and the tests.
+        self.paused = False
+        self.isolated: set[str] = set()
 
     async def send(self, peer: str, msg: Message) -> Message | None:
         """Send to another node. A node that does not answer in time counts as gone."""
+        if self.paused or peer in self.isolated:
+            return None
         msg = {**msg, "sender": self.id}
         try:
             return await protocol.request(self.addresses[peer], msg, PEER_TIMEOUT)
@@ -122,14 +127,19 @@ class StorageNode:
 
     async def handle(self, m: Message) -> Message | None:
         kind = m["type"]
+        if kind == "Control":
+            return self.control(m)
+        if kind == "Status":
+            return self.status()
+        # Look like a crashed node or a cut link: no answer at all.
+        if self.paused or m.get("sender") in self.isolated:
+            return None
         if kind == "RequestVote":
             return self.groups[m["shard"]].on_request_vote(m)
         if kind == "AppendEntries":
             return self.groups[m["shard"]].on_append_entries(m)
         if kind in ("Put", "Delete"):
             return await self.write(m)
-        if kind == "Status":
-            return self.status()
         return {"type": "Error", "error": f"unknown message type {kind}"}
 
     async def write(self, m: Message) -> Message:
@@ -146,10 +156,38 @@ class StorageNode:
             return {"type": "Error", "id": m.get("id"), "error": "not committed in time"}
         return {"type": "Reply", "id": m.get("id"), "ok": True, "index": index}
 
+    def control(self, m: Message) -> Message:
+        """Pause or resume the node, cut or heal its links to other nodes."""
+        action = m.get("action")
+        peers = set(m.get("peers") or self.addresses) - {self.id}
+        if action == "pause":
+            self.paused = True
+        elif action == "resume":
+            self.paused = False
+            for group in self.groups.values():
+                group.reset_election_timer()
+        elif action == "isolate":
+            self.isolated |= peers
+        elif action == "heal":
+            self.isolated -= peers
+        else:
+            return {"type": "Error", "error": f"unknown control action {action}"}
+        for group in self.groups.values():
+            group.paused = self.paused
+        self.events.emit(action, peers=sorted(peers) if action in ("isolate", "heal") else None)
+        return {
+            "type": "ControlReply",
+            "ok": True,
+            "paused": self.paused,
+            "isolated": sorted(self.isolated),
+        }
+
     def status(self) -> Message:
         return {
             "type": "Status",
             "node": self.id,
+            "paused": self.paused,
+            "isolated": sorted(self.isolated),
             "shards": [g.status() for g in self.groups.values()],
         }
 
