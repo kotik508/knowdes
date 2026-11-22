@@ -8,7 +8,7 @@ The full design is in [docs/design-plan.pdf](docs/design-plan.pdf).
 
 ## Status
 
-There is no code yet. Every goal in the table below is a GitHub issue in the milestone with the same date.
+The first goal is reached. Every storage node runs one Raft group per shard with election, log replication and a log in SQLite. Each node also answers Subscribe and Control. Every goal in the table below is a GitHub issue in the milestone with the same date.
 
 | Until | Goal |
 |---|---|
@@ -52,6 +52,35 @@ Every topic of the design plan has one place in the code, so the report can poin
 | `docs/` | design plan and later the report | |
 
 The folders are created together with their first code.
+
+## Deploy
+
+`deploy/cluster.toml` lists the three course machines, `deploy/local.toml` three nodes on one computer.
+
+```sh
+deploy/local.sh start   # three nodes here, data and logs in data/
+deploy/local.sh status
+deploy/local.sh stop
+
+deploy/start.sh         # one node on every course machine over ssh
+deploy/stop.sh
+```
+
+`start.sh` expects the repository in `~/knowdes` on every machine after `uv sync --python 3.12`, since the machines only have Python 3.10. `KNOWDES_DIR` points it somewhere else. From outside the university network the machines are only reachable through `melkki.cs.helsinki.fi`:
+
+```
+Host svm-11.cs.helsinki.fi svm-11-2.cs.helsinki.fi svm-11-3.cs.helsinki.fi
+    User YOUR_UNI_USERNAME
+    ProxyJump YOUR_UNI_USERNAME@melkki.cs.helsinki.fi
+```
+
+Until the console exists a node can be watched and disturbed from the command line:
+
+```sh
+uv run python -m knowdes.debug subscribe 127.0.0.1:7101 --shard 0
+uv run python -m knowdes.debug control 127.0.0.1:7101 isolate n2
+uv run python -m knowdes.debug control 127.0.0.1:7101 heal
+```
 
 ## Development
 

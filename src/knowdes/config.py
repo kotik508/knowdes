@@ -28,3 +28,16 @@ def load(path: Path) -> Cluster:
         shards=int(raw.get("shards", 3)),
         data_dir=Path(data_dir).expanduser() if data_dir else None,
     )
+
+
+def main() -> None:
+    """Print one line "id host port" per node, for the scripts in deploy/."""
+    import sys
+
+    cluster = load(Path(sys.argv[1]))
+    for node_id, (host, port) in cluster.nodes.items():
+        print(node_id, host, port)
+
+
+if __name__ == "__main__":
+    main()
