@@ -5,7 +5,9 @@ for the browser. It holds one Subscribe connection to every storage node and
 merges their events into one stream, and it passes requests from the console
 to a router or, for Control, to the node they name.
 
-    GET  /events    server-sent events, the last events first and then every new one
+    GET  /events    server-sent events, the last events first and then every new one,
+                    plus the status of all nodes twice a second
+    GET  /status    the latest status of all nodes as JSON
     POST /request   one message as JSON, answered with the reply and the time it took
     GET  /          the console page from console/, once it exists
 
@@ -37,6 +39,8 @@ HISTORY = 500
 # A browser that falls this far behind loses the oldest events, like a slow subscriber.
 CLIENT_QUEUE = 1000
 STATIC = Path(__file__).resolve().parents[2] / "console"
+# The cluster view shows role, term and indexes, asked from every node this often.
+POLL = 0.5
 # Messages the gateway sends to one node instead of a router.
 NODE_MESSAGES = ("Control", "Status")
 
@@ -51,6 +55,9 @@ class Gateway:
         self.history: collections.deque[Message] = collections.deque(maxlen=HISTORY)
         self.clients: list[asyncio.Queue] = []
         self.up: dict[str, bool] = {}
+        # Latest Status reply per node, None for a node that did not answer.
+        self.status: dict[str, Message | None] = dict.fromkeys(nodes)
+        self.polled = 0.0
         self.server: asyncio.Server | None = None
         self._tasks: list[asyncio.Task] = []
         # Open event streams, closed on stop so the server can shut down.
@@ -59,6 +66,7 @@ class Gateway:
     async def start(self, host: str, port: int) -> None:
         self.server = await asyncio.start_server(self._serve, host, port)
         self._tasks = [asyncio.create_task(self._follow(n)) for n in self.nodes]
+        self._tasks.append(asyncio.create_task(self._poll()))
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -123,6 +131,30 @@ class Gateway:
             self.mark(node, False)
             await asyncio.sleep(RETRY)
 
+    async def _status_of(self, node: str) -> Message | None:
+        try:
+            reply = await protocol.request(self.nodes[node], {"type": "Status"}, POLL * 0.8)
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            return None
+        return reply if reply.get("type") == "Status" else None
+
+    def snapshot(self) -> Message:
+        return {"time": self.polled, "nodes": self.status}
+
+    async def _poll(self) -> None:
+        """Ask every node for its Status and send the result to every console.
+
+        A paused node still answers Status, it shows as paused. A node that does
+        not answer at all is shown as null and the page greys it out.
+        """
+        while True:
+            nodes = list(self.nodes)
+            replies = await asyncio.gather(*(self._status_of(n) for n in nodes))
+            self.status = dict(zip(nodes, replies, strict=True))
+            self.polled = time.time()
+            self.publish("status", self.snapshot())
+            await asyncio.sleep(POLL)
+
     # Requests from the console.
 
     async def request(self, m: Message) -> Message:
@@ -164,6 +196,8 @@ class Gateway:
                     await respond(writer, 400, {"error": str(err)})
                 else:
                     await respond(writer, 200, await self.request(msg))
+            elif method == "GET" and path == "/status":
+                await respond(writer, 200, self.snapshot())
             elif method == "GET":
                 await self._file(writer, path)
             else:
@@ -177,6 +211,8 @@ class Gateway:
         queue: asyncio.Queue = asyncio.Queue(CLIENT_QUEUE)
         for item in self.history:
             queue.put_nowait(item)
+        if self.polled:
+            queue.put_nowait({"kind": "status", "data": self.snapshot()})
         self.clients.append(queue)
         self._streams.add(writer)
         # The browser sends nothing more, so EOF means it closed the page.

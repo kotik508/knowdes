@@ -47,12 +47,15 @@ async def post(gateway, msg):
 
 
 async def read_events(reader, until, timeout=5.0):
-    """Collect events from the stream until one of them matches."""
+    """Collect node events from the stream until one of them matches, skip status."""
     seen = []
+    kind = b""
     async with asyncio.timeout(timeout):
         while True:
             line = await reader.readline()
-            if line.startswith(b"data: "):
+            if line.startswith(b"event: "):
+                kind = line[7:].strip()
+            elif kind == b"event" and line.startswith(b"data: "):
                 seen.append(json.loads(line[6:]))
                 if until(seen[-1]):
                     return seen
@@ -115,4 +118,33 @@ async def test_static_files_and_errors(tmp_path):
         writer.write(b"POST /request HTTP/1.1\r\nContent-Length: 3\r\n\r\n[1]")
         await writer.drain()
         assert b" 400 " in (await reader.read())[:20]
+        writer.close()
+
+
+async def test_status_shows_roles_and_a_node_that_is_gone(tmp_path):
+    async with setup(tmp_path) as (cluster, gateway):
+        leaders = await cluster.wait_for_leaders()
+        await asyncio.sleep(0.7)
+        status, payload = await http(gateway, "GET", "/status")
+        assert status == 200
+        nodes = json.loads(payload)["nodes"]
+        assert set(nodes) == {"n1", "n2", "n3"}
+        for shard, leader in leaders.items():
+            assert nodes[leader]["shards"][shard]["role"] == "leader"
+        cluster.kill("n3")
+        reader, writer = await asyncio.open_connection(*gateway.address)
+        writer.write(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        await reader.readuntil(b"\r\n\r\n")
+        kind = b""
+        async with asyncio.timeout(5):
+            while True:
+                line = await reader.readline()
+                if line.startswith(b"event: "):
+                    kind = line[7:].strip()
+                elif kind == b"status" and line.startswith(b"data: "):
+                    snapshot = json.loads(line[6:])
+                    if snapshot["nodes"]["n3"] is None:
+                        break
+        assert snapshot["nodes"]["n1"]["node"] == "n1"
         writer.close()
