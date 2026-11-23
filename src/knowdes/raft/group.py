@@ -90,6 +90,8 @@ class RaftGroup:
         self._waiters: dict[int, asyncio.Future] = {}
         # A paused replica neither starts elections nor sends heartbeats (Control, section 5).
         self.paused = False
+        # Leader only: the replica it hands over to, while the handover runs (#14).
+        self.transferring: str | None = None
         self._tasks: list[asyncio.Task] = []
 
     @property
@@ -116,6 +118,7 @@ class RaftGroup:
         return True
 
     def become_follower(self, leader: str | None) -> None:
+        self.transferring = None
         if self.role is Role.LEADER:
             self._fail_waiters(leader)
         if self.role is not Role.FOLLOWER or self.leader != leader:
@@ -274,8 +277,9 @@ class RaftGroup:
 
     async def propose(self, command: Message) -> int:
         """Append a command and wait until a majority stores it. Returns its log index."""
-        if self.role is not Role.LEADER:
-            raise NotLeaderError(self.leader)
+        if self.role is not Role.LEADER or self.transferring is not None:
+            # During a handover new writes would only delay it, the client retries.
+            raise NotLeaderError(self.transferring or self.leader)
         self._append_entries(self.last_index + 1, [{"term": self.term, "command": command}])
         index = self.last_index
         waiter = asyncio.get_running_loop().create_future()
@@ -317,6 +321,57 @@ class RaftGroup:
         while self.last_applied < index:
             await asyncio.sleep(TICK)
         return index
+
+    # Leader transfer, Raft thesis section 3.10 (#14).
+
+    async def transfer(self, target: str) -> bool:
+        """Hand the leadership of this shard to another replica.
+
+        The leader stops taking writes, brings the target up to its last entry and
+        sends it TimeoutNow. The target starts an election at once without waiting
+        for its timer, and as its log is complete it wins. If no new leader shows up
+        within an election timeout the old leader keeps leading and takes writes again.
+        """
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader)
+        if target not in self.peers:
+            raise ValueError(f"{target} is not a replica of shard {self.shard}")
+        term = self.term
+        self.transferring = target
+        self.event("transfer", target=target)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + ELECTION_TIMEOUT[1]
+        try:
+            while self.match_index[target] < self.last_index:
+                if self.role is not Role.LEADER or self.term != term or loop.time() > end:
+                    return False
+                await self._replicate(target)
+                await asyncio.sleep(TICK)
+            reply = await self.send(
+                target,
+                {"type": "TimeoutNow", "shard": self.shard, "term": term, "leader": self.id},
+            )
+            if reply is None or not reply.get("ok"):
+                return False
+            # The vote request of the target carries a newer term and makes us a follower.
+            while self.role is Role.LEADER and self.term == term:
+                if loop.time() > end:
+                    return False
+                await asyncio.sleep(TICK)
+            return True
+        finally:
+            if self.role is Role.LEADER and self.term == term:
+                self.transferring = None
+                self.event("transfer failed", target=target)
+
+    def on_timeout_now(self, m: Message) -> Message:
+        self.observe_term(m["term"])
+        reply = {"type": "TimeoutNowReply", "shard": self.shard, "term": self.term}
+        if m["term"] != self.term or self.role is Role.LEADER or self.paused:
+            return {**reply, "ok": False}
+        self.event("timeout now", leader=m["leader"])
+        self._spawn(self.run_election())
+        return {**reply, "ok": True}
 
     # Handlers for messages from the other replicas.
 

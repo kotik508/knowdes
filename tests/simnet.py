@@ -22,6 +22,8 @@ class Network:
                 return target.on_request_vote(msg)
             if msg["type"] == "AppendEntries":
                 return target.on_append_entries(msg)
+            if msg["type"] == "TimeoutNow":
+                return target.on_timeout_now(msg)
             raise AssertionError(msg["type"])
 
         return send

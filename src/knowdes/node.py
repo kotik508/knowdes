@@ -134,6 +134,8 @@ class StorageNode:
 
     async def handle(self, m: Message) -> Message | None:
         kind = m["type"]
+        if kind == "Control" and m.get("action") == "transfer":
+            return await self.transfer(m)
         if kind == "Control":
             return self.control(m)
         if kind == "Status":
@@ -145,6 +147,8 @@ class StorageNode:
             return self.groups[m["shard"]].on_request_vote(m)
         if kind == "AppendEntries":
             return self.groups[m["shard"]].on_append_entries(m)
+        if kind == "TimeoutNow":
+            return self.groups[m["shard"]].on_timeout_now(m)
         if kind in ("Put", "Delete", "BatchPut"):
             return await self.write(m)
         if kind == "Get":
@@ -200,6 +204,19 @@ class StorageNode:
             "facts": store.get(m["s"]),
             "incoming": store.incoming(m["s"]),
         }
+
+    async def transfer(self, m: Message) -> Message:
+        """Hand the leadership of one shard to another node (#14), sent to the leader."""
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "error": "unknown shard"}
+        try:
+            done = await group.transfer(str(m.get("target")))
+        except NotLeaderError as err:
+            return {"type": "Redirect", "leader": err.leader}
+        except ValueError as err:
+            return {"type": "Error", "error": str(err)}
+        return {"type": "ControlReply", "ok": done, "shard": group.shard, "leader": group.leader}
 
     def control(self, m: Message) -> Message:
         """Pause or resume the node, cut or heal its links to other nodes."""

@@ -68,6 +68,7 @@ class EventLog:
 #     python -m knowdes.debug subscribe 127.0.0.1:7101 --shard 0
 #     python -m knowdes.debug control 127.0.0.1:7101 isolate n2
 #     python -m knowdes.debug control 127.0.0.1:7101 heal
+#     python -m knowdes.debug transfer 127.0.0.1:7101 0 n2
 
 
 async def print_events(address: tuple[str, int], shards: list[int] | None) -> None:
@@ -79,6 +80,11 @@ async def print_events(address: tuple[str, int], shards: list[int] | None) -> No
         stamp = time.strftime("%H:%M:%S", time.localtime(event.get("time", time.time())))
         details = {k: v for k, v in event.items() if k not in ("type", "time", "node", "kind")}
         print(stamp, event.get("node"), event.get("kind"), json.dumps(details), flush=True)
+
+
+async def send_transfer(address: tuple[str, int], shard: int, target: str) -> Message:
+    msg = {"type": "Control", "action": "transfer", "shard": shard, "target": target}
+    return await protocol.request(address, msg, timeout=2.0)
 
 
 async def send_control(address: tuple[str, int], action: str, peers: list[str]) -> Message:
@@ -96,6 +102,10 @@ def main() -> None:
     ctl.add_argument("address", help="host:port of the node")
     ctl.add_argument("action", choices=["pause", "resume", "isolate", "heal"])
     ctl.add_argument("peers", nargs="*", help="node ids, all other nodes if none")
+    move = sub.add_parser("transfer", help="hand the leadership of a shard to another node")
+    move.add_argument("address", help="host:port of the current leader")
+    move.add_argument("shard", type=int)
+    move.add_argument("target", help="node id of the new leader")
     args = parser.parse_args()
     address = protocol.parse_address(args.address)
 
@@ -103,7 +113,10 @@ def main() -> None:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(print_events(address, args.shard))
     else:
-        reply = asyncio.run(send_control(address, args.action, args.peers))
+        if args.command == "transfer":
+            reply = asyncio.run(send_transfer(address, args.shard, args.target))
+        else:
+            reply = asyncio.run(send_control(address, args.action, args.peers))
         print(json.dumps(reply))
         sys.exit(0 if reply.get("ok") else 1)
 
