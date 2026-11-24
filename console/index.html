@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>knowdes console</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #dddbd5;
+    --leader: #1f6f4a; --candidate: #a3620a; --follower: #3b4a6b; --down: #b3b1ab; --bad: #a3261f;
+    font: 14px/1.4 system-ui, sans-serif;
+  }
+  body { margin: 0; background: var(--bg); color: var(--ink); }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 16px; align-items: baseline; }
+  header h1 { font-size: 16px; margin: 0; }
+  header span { color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; padding: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+  h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  #nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+  .node { border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+  .node.down { color: var(--down); }
+  .node.paused { border-style: dashed; }
+  .node b { display: block; margin-bottom: 4px; }
+  .replica { display: grid; grid-template-columns: 64px 1fr; gap: 4px; font-variant-numeric: tabular-nums; }
+  .role-leader { color: var(--leader); font-weight: 600; }
+  .role-candidate { color: var(--candidate); }
+  .role-follower { color: var(--follower); }
+  #timeline { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow: auto; font: 12px/1.5 ui-monospace, monospace; }
+  #timeline li { border-bottom: 1px solid var(--line); padding: 2px 0; }
+  #timeline .t { color: var(--muted); }
+  form { display: grid; grid-template-columns: 90px 1fr; gap: 6px; align-items: center; }
+  input, select, button { font: inherit; padding: 4px 6px; }
+  button { grid-column: 2; justify-self: start; }
+  pre { background: var(--bg); padding: 8px; overflow: auto; max-height: 30vh; font-size: 12px; }
+  .error { color: var(--bad); }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header><h1>knowdes</h1><span id="conn">connecting</span></header>
+<main>
+  <div>
+    <section><h2>Cluster</h2><div id="nodes"></div></section>
+    <section style="margin-top:16px"><h2>Timeline</h2><ul id="timeline"></ul></section>
+  </div>
+  <section>
+    <h2>Query</h2>
+    <form id="query">
+      <label for="type">Request</label>
+      <select id="type"><option>Get</option><option>Neighbors</option><option>Put</option><option>Delete</option></select>
+      <label for="s">Subject</label><input id="s" required>
+      <label for="p">Predicate</label><input id="p">
+      <label for="o">Object</label><input id="o">
+      <label for="depth">Depth</label><input id="depth" type="number" min="1" max="3" value="1">
+      <label for="read">Read</label>
+      <select id="read"><option value="leader">leader</option><option value="follower">follower</option></select>
+      <button>Send</button>
+    </form>
+    <p id="took"></p>
+    <pre id="answer"></pre>
+  </section>
+</main>
+<script>
+// Talks to the gateway only (src/knowdes/gateway.py): /events and /request.
+const KEEP = 500;
+const $ = (id) => document.getElementById(id);
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  Object.assign(node, attrs);
+  node.append(...children);
+  return node;
+}
+
+function showStatus(snapshot) {
+  const box = $("nodes");
+  box.replaceChildren();
+  const leaders = {};
+  for (const st of Object.values(snapshot.nodes)) {
+    // A paused or cut-off old leader still says leader, the one with the newest term counts.
+    for (const r of st?.shards ?? []) {
+      if (r.role === "leader" && !(leaders[r.shard]?.term > r.term)) leaders[r.shard] = r;
+    }
+  }
+  for (const [id, st] of Object.entries(snapshot.nodes)) {
+    const card = el("div", { className: "node" + (st ? "" : " down") + (st?.paused ? " paused" : "") });
+    card.append(el("b", {}, id + (st ? (st.paused ? " (paused)" : "") : " (no answer)")));
+    for (const r of st?.shards ?? []) {
+      const behind = leaders[r.shard] ? leaders[r.shard].last_applied - r.last_applied : null;
+      const lag = behind > 0 ? `, ${behind} behind` : "";
+      card.append(el("div", { className: "replica" },
+        el("span", {}, `shard ${r.shard}`),
+        el("span", { className: "role-" + r.role },
+           `${r.role} t${r.term} c${r.commit_index} a${r.last_applied}${lag}`)));
+    }
+    box.append(card);
+  }
+}
+
+function showEvent(e) {
+  const time = new Date(e.time * 1000).toLocaleTimeString();
+  const rest = Object.entries(e)
+    .filter(([k, v]) => !["type", "time", "node", "kind", "shard"].includes(k) && v !== null)
+    .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
+  const shard = e.shard === null || e.shard === undefined ? "" : ` s${e.shard}`;
+  const item = el("li", {}, el("span", { className: "t" }, time + " "), `${e.node}${shard} ${e.kind} ${rest}`);
+  const list = $("timeline");
+  list.prepend(item);
+  while (list.children.length > KEEP) list.lastChild.remove();
+}
+
+function connect() {
+  const source = new EventSource("/events");
+  source.onopen = () => { $("conn").textContent = "connected"; };
+  source.onerror = () => { $("conn").textContent = "gateway lost, retrying"; };
+  source.addEventListener("status", (m) => showStatus(JSON.parse(m.data)));
+  source.addEventListener("event", (m) => showEvent(JSON.parse(m.data)));
+}
+
+$("query").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const type = $("type").value;
+  const msg = { type, s: $("s").value.trim() };
+  if (type === "Put" || type === "Delete") Object.assign(msg, { p: $("p").value.trim(), o: $("o").value.trim() });
+  if (type === "Get" || type === "Neighbors") msg.read = $("read").value;
+  if (type === "Neighbors") {
+    msg.depth = Number($("depth").value);
+    if ($("p").value.trim()) msg.p = $("p").value.trim();
+  }
+  try {
+    const res = await fetch("/request", { method: "POST", body: JSON.stringify(msg) });
+    const body = await res.json();
+    const r = body.reply ?? body;
+    const who = r.node ? ` by ${r.node} (${r.read} read, applied ${r.applied})` : "";
+    $("took").textContent = `${body.ms ?? "?"} ms${who}`;
+    $("answer").className = r.ok ? "" : "error";
+    $("answer").textContent = JSON.stringify(r, null, 2);
+  } catch (err) {
+    $("answer").className = "error";
+    $("answer").textContent = String(err);
+  }
+});
+
+connect();
+</script>
+</body>
+</html>

@@ -148,3 +148,21 @@ async def test_status_shows_roles_and_a_node_that_is_gone(tmp_path):
                         break
         assert snapshot["nodes"]["n1"]["node"] == "n1"
         writer.close()
+
+
+async def test_serves_the_console_page(tmp_path):
+    cluster = LocalCluster(data_dir=tmp_path)
+    cluster.start()
+    nodes = {n: ("127.0.0.1", p) for n, p in cluster.ports.items()}
+    gateway = Gateway(nodes, cluster.shards)
+    try:
+        await gateway.start("127.0.0.1", 0)
+        status, body = await http(gateway, "GET", "/")
+        assert status == 200
+        page = body.decode()
+        # The page only talks to the two endpoints of the gateway.
+        assert 'new EventSource("/events")' in page
+        assert 'fetch("/request"' in page
+    finally:
+        await gateway.stop()
+        cluster.stop()
