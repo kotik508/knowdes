@@ -12,14 +12,14 @@ from knowdes.client import Client as GraphClient
 from knowdes.router import Router
 
 
-def server(address):
+def server(address, *extra):
     host, port = address
-    args = ["-m", "knowdes.mcp_server", "--router", f"{host}:{port}"]
+    args = ["-m", "knowdes.mcp_server", "--router", f"{host}:{port}", *extra]
     return StdioServerParameters(command=sys.executable, args=args)
 
 
 @contextlib.asynccontextmanager
-async def setup(tmp_path):
+async def setup(tmp_path, *extra):
     cluster = LocalCluster(data_dir=tmp_path)
     cluster.start()
     nodes = {n: ("127.0.0.1", p) for n, p in cluster.ports.items()}
@@ -34,7 +34,7 @@ async def setup(tmp_path):
         ]:
             msg = {"type": "Put", "s": s, "p": p, "o": o}
             assert (await protocol.request(router.address, msg, 5.0))["ok"]
-        async with Client(server(router.address)) as mcp:
+        async with Client(server(router.address, *extra)) as mcp:
             yield mcp
     finally:
         await router.stop()
@@ -78,3 +78,24 @@ async def test_router_that_does_not_answer():
         reply = await mcp.call_tool("get", {"subject": "CSM13001"})
         assert reply.is_error
         assert "does not answer" in reply.content[0].text
+
+
+async def test_put_and_delete_with_reverse_edges(tmp_path):
+    async with setup(tmp_path) as mcp:
+        names = {t.name for t in (await mcp.list_tools()).tools}
+        assert {"put", "delete"} <= names
+        edge = {"subject": "TKT21028", "predicate": "teacher", "object": "niklander"}
+        assert result(await mcp.call_tool("put", edge))["index"] > 0
+        back = result(await mcp.call_tool("get", {"subject": "niklander"}))
+        assert back["incoming"]["teacher"] == ["CSM13001", "TKT21028"]
+        result(await mcp.call_tool("delete", edge))
+        assert result(await mcp.call_tool("get", {"subject": "TKT21028"}))["facts"] == {}
+        back = result(await mcp.call_tool("get", {"subject": "niklander"}))
+        assert back["incoming"]["teacher"] == ["CSM13001"]
+
+
+async def test_read_only_server_has_no_write_tools(tmp_path):
+    async with setup(tmp_path, "--read-only") as mcp:
+        tools = {t.name: t for t in (await mcp.list_tools()).tools}
+        assert set(tools) == {"get", "neighbors"}
+        assert tools["get"].annotations.read_only_hint

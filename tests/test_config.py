@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from cluster import free_port
+from cluster import free_ports
 
 from knowdes import config, protocol
 
@@ -34,7 +34,7 @@ def test_too_few_nodes(tmp_path):
 
 
 async def test_nodes_start_from_config(tmp_path):
-    ports = {f"n{i}": free_port() for i in (1, 2, 3)}
+    ports = dict(zip(("n1", "n2", "n3"), free_ports(3), strict=True))
     lines = [f'data_dir = "{tmp_path}"']
     for node, port in ports.items():
         lines += [f"[nodes.{node}]", 'host = "127.0.0.1"', f"port = {port}"]

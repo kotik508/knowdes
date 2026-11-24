@@ -11,14 +11,25 @@ from knowdes import protocol
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return free_ports(1)[0]
+
+
+def free_ports(count: int) -> list[int]:
+    """Distinct free ports. All sockets stay open until the last one is bound,
+    otherwise the system may hand out the same port twice."""
+    sockets = [socket.socket() for _ in range(count)]
+    try:
+        for s in sockets:
+            s.bind(("127.0.0.1", 0))
+        return [s.getsockname()[1] for s in sockets]
+    finally:
+        for s in sockets:
+            s.close()
 
 
 class LocalCluster:
     def __init__(self, ids=("n1", "n2", "n3"), shards=3, data_dir=None):
-        self.ports = {i: free_port() for i in ids}
+        self.ports = dict(zip(ids, free_ports(len(ids)), strict=True))
         self.shards = shards
         self.data_dir = data_dir
         self.procs: dict[str, subprocess.Popen] = {}
