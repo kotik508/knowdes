@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,28 @@ class Client:
             # stay behind, so source facts get reverse edges only with #12.
             await self.call(shard_of(o, self.shards), {**msg, "reverse": True})
         return reply
+
+    async def transact(self, facts: list[dict[str, Any]], tx: str | None = None) -> Message:
+        """Write facts on several shards with two-phase commit (#12): all or none.
+
+        A fact is {"op", "s", "p", "o"} with op put, delete, rput or rdelete. The
+        shard of a reverse edge (rput, rdelete) is the one of its object. The
+        leader of the shard of the first fact coordinates.
+        """
+        writes: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for fact in facts:
+            key = fact["o"] if fact["op"] in ("rput", "rdelete") else fact["s"]
+            writes[shard_of(key, self.shards)].append(fact)
+        first = facts[0]
+        coordinator = shard_of(
+            first["o"] if first["op"] in ("rput", "rdelete") else first["s"], self.shards
+        )
+        msg = {
+            "type": "TxWrite",
+            "tx": tx or uuid.uuid4().hex,
+            "writes": [{"shard": shard, "facts": f} for shard, f in sorted(writes.items())],
+        }
+        return await self.call(coordinator, msg, patience=6.0)
 
     async def put(self, s: str, p: str, o: str, version: int | None = None) -> Message:
         return await self.write("Put", s, p, o, version)

@@ -117,6 +117,9 @@ class RaftGroup:
     def majority(self) -> int:
         return len(self.members) // 2 + 1
 
+    def is_leader(self) -> bool:
+        return self.role is Role.LEADER and self.transferring is None
+
     @property
     def is_member(self) -> bool:
         return self.id in self.members

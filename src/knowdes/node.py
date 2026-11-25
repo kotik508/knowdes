@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 from pathlib import Path
+from typing import Any
 
 from knowdes import config, protocol
 from knowdes.debug import EventLog
@@ -34,6 +35,10 @@ from knowdes.store import ShardStore
 
 # Timeout for one message to another node. A heartbeat interval is 50 ms.
 PEER_TIMEOUT = 0.1
+# How long the coordinator looks for the leader of a participant shard (#12).
+TX_PATIENCE = 2.0
+# Ops a transaction may write: facts and reverse edges.
+TX_FACT_OPS = ("put", "delete", "rput", "rdelete")
 
 
 class StorageNode:
@@ -190,6 +195,10 @@ class StorageNode:
             return group.on_timeout_now(m)
         if kind in ("Put", "Delete", "BatchPut"):
             return await self.write(m)
+        if kind == "TxWrite":
+            return await self.coordinate(m)
+        if kind in ("Prepare", "Commit", "Abort"):
+            return await self.participate(m)
         if kind == "Get":
             return await self.get(m)
         return {"type": "Error", "error": f"unknown message type {kind}"}
@@ -243,6 +252,131 @@ class StorageNode:
             "facts": store.get(m["s"]),
             "incoming": store.incoming(m["s"]),
         }
+
+    # Two-phase commit (#12, design plan section 3.3). The coordinator is the leader
+    # of one shard, usually the shard of the subject, not the router. Prepare, the
+    # decision and its outcome are entries in the Raft logs, so a new leader can
+    # finish a transaction the old one started and the router stays stateless.
+
+    async def coordinate(self, m: Message) -> Message:
+        """TxWrite: write facts on several shards, on all of them or on none."""
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
+        if not group.is_leader():
+            return self.redirect(m, group.leader)
+        try:
+            tx = str(m["tx"])
+            writes = {int(w["shard"]): [tx_fact(f) for f in w["facts"]] for w in m["writes"]}
+        except (KeyError, TypeError, ValueError) as err:
+            return {"type": "Error", "id": m.get("id"), "error": f"bad transaction: {err}"}
+        if any(not 0 <= shard < self.shards for shard in writes):
+            return {"type": "Error", "id": m.get("id"), "error": "unknown shard"}
+        participants = sorted(writes)
+        replies = await asyncio.gather(
+            *(
+                self.ask_leader(shard, {"type": "Prepare", "tx": tx, "facts": writes[shard]})
+                for shard in participants
+            )
+        )
+        votes = {
+            shard: bool(r and r.get("vote")) for shard, r in zip(participants, replies, strict=True)
+        }
+        decision = "commit" if all(votes.values()) else "abort"
+        record = {"op": "decide", "tx": tx, "decision": decision, "participants": participants}
+        try:
+            index = await group.propose(record)
+        except NotLeaderError as err:
+            # Not decided here, so every participant still waits. The client may retry.
+            return self.redirect(m, err.leader)
+        except TimeoutError:
+            return {"type": "Error", "id": m.get("id"), "error": "decision not committed"}
+        # A decision once in the log is final, the store keeps the first one.
+        decision = self.stores[group.shard].decision(tx)["decision"]
+        self.events.emit("decide", group.shard, tx=tx, decision=decision, votes=votes)
+        kind = "Commit" if decision == "commit" else "Abort"
+        acks = await asyncio.gather(
+            *(self.ask_leader(shard, {"type": kind, "tx": tx}) for shard in participants)
+        )
+        # A participant that did not answer keeps the transaction open. It learns
+        # the decision later from the coordinator shard (#12, recovery).
+        pending = [
+            shard for shard, a in zip(participants, acks, strict=True) if not (a and a.get("ok"))
+        ]
+        return {
+            "type": "Reply",
+            "id": m.get("id"),
+            "ok": True,
+            "tx": tx,
+            "decision": decision,
+            "votes": {str(k): v for k, v in votes.items()},
+            "index": index,
+            "pending": pending,
+        }
+
+    async def participate(self, m: Message) -> Message:
+        """Prepare, Commit or Abort at the leader of a participant shard."""
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "error": "unknown shard"}
+        tx = str(m.get("tx"))
+        if m["type"] == "Prepare":
+            command: Message = {"op": "prepare", "tx": tx, "facts": list(m.get("facts", []))}
+        else:
+            command = {"op": m["type"].lower(), "tx": tx}
+        try:
+            await group.propose(command)
+        except NotLeaderError as err:
+            return self.redirect(m, err.leader)
+        except TimeoutError:
+            return {"type": "Error", "error": "not committed in time"}
+        state = self.stores[group.shard].transaction(tx)
+        if m["type"] == "Prepare":
+            vote = state == "prepared"
+            self.events.emit("prepare", group.shard, tx=tx, vote=vote)
+            return {"type": "Vote", "ok": True, "shard": group.shard, "tx": tx, "vote": vote}
+        self.events.emit(f"tx {state}", group.shard, tx=tx)
+        return {"type": "Ack", "ok": True, "shard": group.shard, "tx": tx, "state": state}
+
+    async def ask_leader(self, shard: int, msg: Message) -> Message | None:
+        """Send to the leader of a shard, this node included. None if none answers in time."""
+        msg = {**msg, "shard": shard}
+        loop = asyncio.get_running_loop()
+        end = loop.time() + TX_PATIENCE
+        hint = self.groups[shard].leader if shard in self.groups else None
+        tried = 0
+        while loop.time() < end:
+            order = sorted(self.addresses)
+            node = hint or order[tried % len(order)]
+            tried += 1
+            hint = None
+            if node == self.id:
+                reply = await self.participate(msg) if shard in self.groups else None
+            else:
+                reply = await self.call_peer(node, msg)
+            if reply is None:
+                await asyncio.sleep(0.05)
+                continue
+            if reply.get("type") == "Redirect":
+                if reply.get("address") and reply.get("leader") not in self.addresses:
+                    self.addresses[reply["leader"]] = tuple(reply["address"])
+                hint = reply.get("leader")
+                if hint is None:
+                    await asyncio.sleep(0.05)
+                continue
+            if reply.get("ok"):
+                return reply
+            await asyncio.sleep(0.05)
+        return None
+
+    async def call_peer(self, peer: str, msg: Message) -> Message | None:
+        """Like send, but with time for a Raft round at the other end."""
+        if self.paused or peer in self.isolated or peer not in self.addresses:
+            return None
+        try:
+            return await protocol.request(self.addresses[peer], {**msg, "sender": self.id}, 1.5)
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            return None
 
     def redirect(self, m: Message, leader: str | None) -> Message:
         """Name the leader, with its address, as a client may not know a node added later."""
@@ -330,6 +464,16 @@ def write_command(m: Message) -> Message:
     if m["type"] == "BatchPut":
         return {"op": "batch", "facts": [fact_command(f.get("op", "put"), f) for f in m["facts"]]}
     return fact_command(m["type"].lower(), m)
+
+
+def tx_fact(f: Any) -> Message:
+    """One fact of a transaction, as the log entry the participant applies on commit."""
+    if f["op"] not in TX_FACT_OPS:
+        raise ValueError(f"a transaction writes {TX_FACT_OPS}, not {f['op']}")
+    command = {"op": f["op"], "s": str(f["s"]), "p": str(f["p"]), "o": str(f["o"])}
+    if f.get("version") is not None:
+        command["version"] = int(f["version"])
+    return command
 
 
 def fact_command(op: str, m: Message) -> Message:
