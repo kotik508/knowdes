@@ -29,6 +29,9 @@
   #timeline { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow: auto; font: 12px/1.5 ui-monospace, monospace; }
   #timeline li { border-bottom: 1px solid var(--line); padding: 2px 0; }
   #timeline .t { color: var(--muted); }
+  #timeline li.hidden { display: none; }
+  .filters { display: flex; gap: 12px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+  .filters label { color: var(--muted); }
   form { display: grid; grid-template-columns: 90px 1fr; gap: 6px; align-items: center; }
   input, select, button { font: inherit; padding: 4px 6px; }
   button { grid-column: 2; justify-self: start; }
@@ -42,7 +45,14 @@
 <main>
   <div>
     <section><h2>Cluster</h2><div id="nodes"></div></section>
-    <section style="margin-top:16px"><h2>Timeline</h2><ul id="timeline"></ul></section>
+    <section style="margin-top:16px"><h2>Timeline</h2>
+      <div class="filters">
+        <label>Shard <select id="f-shard"><option value="">all</option></select></label>
+        <label>Kind <select id="f-kind"><option value="">all</option></select></label>
+        <label>Node <select id="f-node"><option value="">all</option></select></label>
+        <span id="f-count"></span>
+      </div>
+      <ul id="timeline"></ul></section>
   </div>
   <section>
     <h2>Query</h2>
@@ -98,6 +108,46 @@ function showStatus(snapshot) {
   }
 }
 
+// Timeline filters (design plan section 5): by shard, by kind of event and by node.
+// An event without a shard (pause, up, down) belongs to every shard.
+const seen = { shard: new Set(), kind: new Set(), node: new Set() };
+
+function addOption(name, value) {
+  if (value === "" || seen[name].has(value)) return;
+  seen[name].add(value);
+  const select = $("f-" + name);
+  const options = [...select.options].slice(1).map((o) => o.value);
+  options.push(value);
+  options.sort((a, b) => (name === "shard" ? Number(a) - Number(b) : a.localeCompare(b)));
+  select.replaceChildren(select.options[0], ...options.map((v) => el("option", { value: v, textContent: v })));
+  select.value = select.dataset.value ?? "";
+}
+
+function matches(item) {
+  const shard = $("f-shard").value, kind = $("f-kind").value, node = $("f-node").value;
+  return (!shard || item.dataset.shard === "" || item.dataset.shard === shard)
+    && (!kind || item.dataset.kind === kind)
+    && (!node || item.dataset.node === node);
+}
+
+function applyFilters() {
+  let shown = 0;
+  const list = $("timeline");
+  for (const item of list.children) {
+    const show = matches(item);
+    item.classList.toggle("hidden", !show);
+    shown += show;
+  }
+  $("f-count").textContent = `${shown} of ${list.children.length}`;
+}
+
+for (const name of ["shard", "kind", "node"]) {
+  $("f-" + name).addEventListener("change", (ev) => {
+    ev.target.dataset.value = ev.target.value;
+    applyFilters();
+  });
+}
+
 function showEvent(e) {
   const time = new Date(e.time * 1000).toLocaleTimeString();
   const rest = Object.entries(e)
@@ -105,9 +155,17 @@ function showEvent(e) {
     .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
   const shard = e.shard === null || e.shard === undefined ? "" : ` s${e.shard}`;
   const item = el("li", {}, el("span", { className: "t" }, time + " "), `${e.node}${shard} ${e.kind} ${rest}`);
+  const shardId = e.shard === null || e.shard === undefined ? "" : String(e.shard);
+  Object.assign(item.dataset, { shard: shardId, kind: e.kind, node: e.node });
+  addOption("shard", shardId);
+  addOption("kind", e.kind);
+  addOption("node", e.node);
+  item.classList.toggle("hidden", !matches(item));
   const list = $("timeline");
   list.prepend(item);
   while (list.children.length > KEEP) list.lastChild.remove();
+  const shown = [...list.children].filter((li) => !li.classList.contains("hidden")).length;
+  $("f-count").textContent = `${shown} of ${list.children.length}`;
 }
 
 function connect() {

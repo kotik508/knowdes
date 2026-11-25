@@ -166,3 +166,19 @@ async def test_serves_the_console_page(tmp_path):
     finally:
         await gateway.stop()
         cluster.stop()
+
+
+async def test_console_page_has_timeline_filters(tmp_path):
+    cluster = LocalCluster(data_dir=tmp_path)
+    cluster.start()
+    nodes = {n: ("127.0.0.1", p) for n, p in cluster.ports.items()}
+    gateway = Gateway(nodes, cluster.shards)
+    try:
+        await gateway.start("127.0.0.1", 0)
+        _, body = await http(gateway, "GET", "/")
+        page = body.decode()
+        for name in ("f-shard", "f-kind", "f-node"):
+            assert f'id="{name}"' in page
+    finally:
+        await gateway.stop()
+        cluster.stop()
