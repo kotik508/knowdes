@@ -5,6 +5,12 @@ clients and hands each message to the Raft group of its shard.
 
     python -m knowdes.node --config deploy/cluster.toml --id n1
 
+A node can also start empty and get its replicas later, while the cluster
+runs (#14): the leader of a shard adds it with AddReplica, it catches up from
+the log and then counts as a member.
+
+    python -m knowdes.node --id n4 --listen 127.0.0.1:7104 --empty --peer n1=127.0.0.1:7101
+
 or without a config file
 
     python -m knowdes.node --id n1 --listen 127.0.0.1:7101 \\
@@ -37,34 +43,61 @@ class StorageNode:
         addresses: dict[str, tuple[str, int]],
         shards: int = 3,
         data_dir: Path | None = None,
+        empty: bool = False,
     ) -> None:
         self.id = node_id
         self.addresses = addresses
-        members = sorted(addresses)
+        self.shards = shards
+        self.members = sorted(addresses)
         # Without a data directory nothing survives a restart, which suits some tests.
         self.db = open_database(data_dir / f"{node_id}.db") if data_dir else None
         self.events = EventLog(node_id, data_dir / f"{node_id}-events.log" if data_dir else None)
-        self.stores = {s: ShardStore() for s in range(shards)}
-        self.groups = {
-            s: RaftGroup(
-                s,
-                node_id,
-                members,
-                self.send,
-                apply=lambda index, command, store=self.stores[s]: store.apply(command),
-                storage=SqliteStorage(self.db, s) if self.db else MemoryStorage(),
-                emit=self.events.emit,
-            )
-            for s in range(shards)
-        }
+        self.stores: dict[int, ShardStore] = {}
+        self.groups: dict[int, RaftGroup] = {}
+        self.started = False
+        # An empty node waits until a leader adds it to a shard (#14). It does not
+        # know the members yet, the log it receives tells it.
+        for s in [] if empty else range(shards):
+            self.add_group(s, self.members)
         self.server: asyncio.Server | None = None
         # Fault injection through Control messages, for the console and the tests.
         self.paused = False
         self.isolated: set[str] = set()
 
+    def add_group(self, shard: int, members: list[str]) -> RaftGroup:
+        self.stores[shard] = store = ShardStore()
+        group = RaftGroup(
+            shard,
+            self.id,
+            members,
+            self.send,
+            apply=lambda index, command: store.apply(command),
+            storage=SqliteStorage(self.db, shard) if self.db else MemoryStorage(),
+            emit=self.events.emit,
+            on_config=self.learn_addresses,
+        )
+        self.groups[shard] = group
+        if self.started:
+            group.start()
+        return group
+
+    def group_for(self, m: Message) -> RaftGroup | None:
+        """The replica a Raft message is for. A leader that added this node creates it."""
+        shard = m.get("shard")
+        if shard in self.groups:
+            return self.groups[shard]
+        if isinstance(shard, int) and 0 <= shard < self.shards:
+            return self.add_group(shard, [])
+        return None
+
+    def learn_addresses(self, members: list[str], addresses: dict[str, list]) -> None:
+        for node, address in addresses.items():
+            if node != self.id:
+                self.addresses[node] = (address[0], int(address[1]))
+
     async def send(self, peer: str, msg: Message) -> Message | None:
         """Send to another node. A node that does not answer in time counts as gone."""
-        if self.paused or peer in self.isolated:
+        if self.paused or peer in self.isolated or peer not in self.addresses:
             return None
         msg = {**msg, "sender": self.id}
         try:
@@ -75,6 +108,7 @@ class StorageNode:
     async def start(self) -> None:
         host, port = self.addresses[self.id]
         self.server = await asyncio.start_server(self._serve, host, port, limit=protocol.LINE_LIMIT)
+        self.started = True
         for group in self.groups.values():
             group.start()
 
@@ -136,6 +170,8 @@ class StorageNode:
         kind = m["type"]
         if kind == "Control" and m.get("action") == "transfer":
             return await self.transfer(m)
+        if kind in ("AddReplica", "RemoveReplica"):
+            return await self.change_replicas(m)
         if kind == "Control":
             return self.control(m)
         if kind == "Status":
@@ -143,12 +179,15 @@ class StorageNode:
         # Look like a crashed node or a cut link: no answer at all.
         if self.paused or m.get("sender") in self.isolated:
             return None
-        if kind == "RequestVote":
-            return self.groups[m["shard"]].on_request_vote(m)
-        if kind == "AppendEntries":
-            return self.groups[m["shard"]].on_append_entries(m)
-        if kind == "TimeoutNow":
-            return self.groups[m["shard"]].on_timeout_now(m)
+        if kind in ("RequestVote", "AppendEntries", "TimeoutNow"):
+            group = self.group_for(m)
+            if group is None:
+                return {"type": "Error", "error": "unknown shard"}
+            if kind == "RequestVote":
+                return group.on_request_vote(m)
+            if kind == "AppendEntries":
+                return group.on_append_entries(m)
+            return group.on_timeout_now(m)
         if kind in ("Put", "Delete", "BatchPut"):
             return await self.write(m)
         if kind == "Get":
@@ -167,7 +206,7 @@ class StorageNode:
         try:
             index = await group.propose(command)
         except NotLeaderError as err:
-            return {"type": "Redirect", "id": m.get("id"), "leader": err.leader}
+            return self.redirect(m, err.leader)
         except TimeoutError:
             return {"type": "Error", "id": m.get("id"), "error": "not committed in time"}
         return {"type": "Reply", "id": m.get("id"), "ok": True, "index": index}
@@ -188,7 +227,7 @@ class StorageNode:
             try:
                 await group.read_index()
             except NotLeaderError as err:
-                return {"type": "Redirect", "id": m.get("id"), "leader": err.leader}
+                return self.redirect(m, err.leader)
             except TimeoutError:
                 return {"type": "Error", "id": m.get("id"), "error": "leadership not confirmed"}
         elif level != "follower":
@@ -204,6 +243,34 @@ class StorageNode:
             "facts": store.get(m["s"]),
             "incoming": store.incoming(m["s"]),
         }
+
+    def redirect(self, m: Message, leader: str | None) -> Message:
+        """Name the leader, with its address, as a client may not know a node added later."""
+        reply: Message = {"type": "Redirect", "id": m.get("id"), "leader": leader}
+        if leader in self.addresses:
+            reply["address"] = list(self.addresses[leader])
+        return reply
+
+    async def change_replicas(self, m: Message) -> Message:
+        """Add a node to the replicas of a shard or remove one (#14), sent to the leader."""
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "error": "unknown shard"}
+        node = str(m.get("node"))
+        try:
+            if m["type"] == "AddReplica":
+                if m.get("address"):
+                    self.addresses[node] = protocol.parse_address(str(m["address"]))
+                if node not in self.addresses:
+                    return {"type": "Error", "error": f"address of {node} unknown"}
+                done = await group.add_replica(node, self.addresses)
+            else:
+                done = await group.remove_replica(node, self.addresses)
+        except NotLeaderError as err:
+            return self.redirect(m, err.leader)
+        except (ValueError, TimeoutError) as err:
+            return {"type": "Error", "error": str(err) or "not committed in time"}
+        return {"type": "ControlReply", "ok": done, "shard": group.shard, "members": group.members}
 
     async def transfer(self, m: Message) -> Message:
         """Hand the leadership of one shard to another node (#14), sent to the leader."""
@@ -283,6 +350,7 @@ def main() -> None:
     parser.add_argument("--peer", action="append", default=[], help="id=host:port")
     parser.add_argument("--shards", type=int)
     parser.add_argument("--data-dir", type=Path, help="keep term, vote and log here")
+    parser.add_argument("--empty", action="store_true", help="start without replicas (#14)")
     args = parser.parse_args()
 
     if args.config:
@@ -307,7 +375,7 @@ def main() -> None:
         addresses[args.id] = ("0.0.0.0", port)
 
     async def run() -> None:
-        node = StorageNode(args.id, addresses, shards, data_dir)
+        node = StorageNode(args.id, addresses, shards, data_dir, empty=args.empty)
         await node.start()
         try:
             await asyncio.Event().wait()

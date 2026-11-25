@@ -3,6 +3,12 @@
 A storage node runs one RaftGroup per shard. The group never opens a socket
 itself. It gets a send function from the node, so the tests can run several
 groups on a simulated network.
+
+The replicas of a group can change while it runs (#14), one server at a time
+as in the Raft thesis, section 4.1. The members are an entry in the log, and
+every replica uses the newest such entry in its log, committed or not. A new
+replica first gets the log as a learner that does not count for a majority,
+so adding it does not stall the group while it catches up (section 4.2.1).
 """
 
 from __future__ import annotations
@@ -23,12 +29,16 @@ Send = Callable[[str, Message], Awaitable[Message | None]]
 Apply = Callable[[int, Message | None], None]
 # Reports an event for the log file and the console: emit(kind, shard, **details).
 Emit = Callable[..., Any]
+# Told about the members and their addresses whenever a config entry is used.
+OnConfig = Callable[[list[str], dict[str, Any]], Any]
 
 # Range of the random election timeout and the heartbeat interval, section 3.4.
 ELECTION_TIMEOUT = (0.15, 0.30)
 HEARTBEAT_INTERVAL = 0.05
 # How long a client write waits for its entry to be committed.
 COMMIT_TIMEOUT = 1.0
+# How long a new replica may take to catch up before it becomes a member.
+CATCH_UP_TIMEOUT = 5.0
 # How often the timer loop looks at the election deadline.
 TICK = 0.01
 
@@ -60,10 +70,14 @@ class RaftGroup:
         storage=None,
         emit: Emit | None = None,
         rng: random.Random | None = None,
+        on_config: OnConfig | None = None,
     ) -> None:
         self.shard = shard
         self.id = node_id
-        self.peers = [m for m in members if m != node_id]
+        self.initial_members = sorted(members)
+        self.members: list[str] = []
+        self.peers: list[str] = []
+        self.on_config = on_config or (lambda members, addresses: None)
         self.send = send
         self.apply = apply or (lambda index, command: None)
         self._emit = emit or (lambda kind, shard, **details: None)
@@ -92,17 +106,102 @@ class RaftGroup:
         self.paused = False
         # Leader only: the replica it hands over to, while the handover runs (#14).
         self.transferring: str | None = None
+        # Leader only: replicas that get the log but do not vote yet (#14).
+        self.learners: set[str] = set()
         self._tasks: list[asyncio.Task] = []
+        # Index of the config entry in use, 0 for the members given at the start.
+        self.config_index = 0
+        self._find_config()
 
     @property
     def majority(self) -> int:
-        return (len(self.peers) + 1) // 2 + 1
+        return len(self.members) // 2 + 1
+
+    @property
+    def is_member(self) -> bool:
+        return self.id in self.members
+
+    # Members, Raft thesis section 4.1 (#14).
+
+    def _find_config(self, start: int = 1) -> None:
+        """Use the newest config entry from start on, the members given at the start without one."""
+        for index in range(self.last_index, start - 1, -1):
+            command = self.log[index]["command"]
+            if command is not None and command.get("op") == "config":
+                self.config_index = index
+                self._use_members(list(command["members"]), command.get("addresses", {}))
+                return
+        if start <= 1:
+            self.config_index = 0
+            self._use_members(self.initial_members, {})
+
+    def _use_members(self, members: list[str], addresses: dict[str, Any]) -> None:
+        if sorted(members) == self.members and not addresses:
+            return
+        self.on_config(sorted(members), addresses)
+        changed = bool(self.members)
+        self.members = sorted(members)
+        self.peers = [m for m in self.members if m != self.id]
+        for peer in self.peers:
+            self.learners.discard(peer)
+            self.next_index.setdefault(peer, self.last_index + 1)
+            self.match_index.setdefault(peer, 0)
+        if changed:
+            self.event("members", members=self.members)
+
+    async def add_replica(self, node: str, addresses: dict[str, Any]) -> bool:
+        """Bring a new replica up to date as a learner, then make it a member."""
+        self._check_change(node)
+        if node in self.members:
+            return True
+        term = self.term
+        self.learners.add(node)
+        self.next_index[node] = self.last_index + 1
+        self.match_index[node] = 0
+        self.event("learner", node=node)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + CATCH_UP_TIMEOUT
+        try:
+            while self.match_index[node] < self.commit_index or self.match_index[node] == 0:
+                if self.role is not Role.LEADER or self.term != term or loop.time() > end:
+                    return False
+                await self._replicate(node)
+                await asyncio.sleep(TICK)
+        finally:
+            self.learners.discard(node)
+        await self._propose_config([*self.members, node], addresses)
+        return True
+
+    async def remove_replica(self, node: str, addresses: dict[str, Any]) -> bool:
+        self._check_change(node)
+        if node == self.id:
+            raise ValueError("move the leadership away before removing the leader")
+        if node not in self.members:
+            return True
+        if len(self.members) <= 1:
+            raise ValueError("a shard needs at least one replica")
+        await self._propose_config([m for m in self.members if m != node], addresses)
+        self.next_index.pop(node, None)
+        self.match_index.pop(node, None)
+        return True
+
+    def _check_change(self, node: str) -> None:
+        if self.role is not Role.LEADER or self.transferring is not None:
+            raise NotLeaderError(self.transferring or self.leader)
+        # One change at a time: the last one has to be committed first (section 4.1).
+        if self.config_index > self.commit_index:
+            raise ValueError("another change of the members is still running")
+
+    async def _propose_config(self, members: list[str], addresses: dict[str, Any]) -> None:
+        known = {m: list(addresses[m]) for m in members if m in addresses}
+        await self.propose({"op": "config", "members": sorted(members), "addresses": known})
 
     def reset_election_timer(self) -> None:
         self.deadline = time.monotonic() + self.rng.uniform(*ELECTION_TIMEOUT)
 
     def election_due(self) -> bool:
-        return self.role is not Role.LEADER and time.monotonic() >= self.deadline
+        # A replica that is not (or no longer) a member never starts an election.
+        return self.is_member and self.role is not Role.LEADER and time.monotonic() >= self.deadline
 
     def observe_term(self, term: int) -> bool:
         """Apply the rule for all servers: a newer term turns us into a follower.
@@ -144,6 +243,7 @@ class RaftGroup:
         self.event("leader")
         self.next_index = {p: self.last_index + 1 for p in self.peers}
         self.match_index = {p: 0 for p in self.peers}
+        self.learners.clear()
         # An empty entry of the new term lets the leader commit everything before it
         # (Raft paper, section 5.4.2).
         self._append_entries(self.last_index + 1, [{"term": self.term, "command": None}])
@@ -208,7 +308,8 @@ class RaftGroup:
     async def _heartbeats(self, term: int) -> None:
         while self.role is Role.LEADER and self.term == term:
             if not self.paused:
-                await asyncio.gather(*(self._replicate(p) for p in self.peers))
+                targets = [*self.peers, *sorted(self.learners)]
+                await asyncio.gather(*(self._replicate(p) for p in targets))
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def _replicate(self, peer: str) -> bool:
@@ -231,7 +332,7 @@ class RaftGroup:
         reply = await self.send(peer, request)
         if reply is None or self.observe_term(reply["term"]):
             return False
-        if self.role is not Role.LEADER or self.term != term:
+        if self.role is not Role.LEADER or self.term != term or peer not in self.next_index:
             return False
         if reply["success"]:
             match = prev + len(request["entries"])
@@ -251,7 +352,7 @@ class RaftGroup:
 
     def _advance_commit(self) -> None:
         for index in range(self.last_index, self.commit_index, -1):
-            stored = 1 + sum(m >= index for m in self.match_index.values())
+            stored = self.is_member + sum(self.match_index.get(p, 0) >= index for p in self.peers)
             # Only entries of the current term are committed by counting (section 5.4.2).
             if stored >= self.majority and self.log[index]["term"] == self.term:
                 self.commit_index = index
@@ -262,7 +363,10 @@ class RaftGroup:
     def _apply_committed(self) -> None:
         while self.last_applied < self.commit_index:
             self.last_applied += 1
-            self.apply(self.last_applied, self.log[self.last_applied]["command"])
+            command = self.log[self.last_applied]["command"]
+            # Config entries belong to Raft, the store never sees them.
+            if command is None or command.get("op") != "config":
+                self.apply(self.last_applied, command)
             waiter = self._waiters.pop(self.last_applied, None)
             if waiter is not None and not waiter.done():
                 waiter.set_result(self.last_applied)
@@ -435,6 +539,9 @@ class RaftGroup:
         self.storage.append(index, entries)
         del self.log[index:]
         self.log.extend(entries)
+        # A config entry counts as soon as it is in the log. If the one in use was cut
+        # off with a conflicting tail, the one before it counts again.
+        self._find_config(1 if index <= self.config_index else index)
 
     def status(self) -> Message:
         return {
@@ -445,4 +552,5 @@ class RaftGroup:
             "last_index": self.last_index,
             "commit_index": self.commit_index,
             "last_applied": self.last_applied,
+            "members": self.members,
         }

@@ -28,22 +28,34 @@ def free_ports(count: int) -> list[int]:
 
 
 class LocalCluster:
-    def __init__(self, ids=("n1", "n2", "n3"), shards=3, data_dir=None):
-        self.ports = dict(zip(ids, free_ports(len(ids)), strict=True))
+    def __init__(self, ids=("n1", "n2", "n3"), shards=3, data_dir=None, spare=()):
+        """spare: extra nodes that start empty and join at runtime (#14)."""
+        self.spare = tuple(spare)
+        self.ports = dict(
+            zip((*ids, *self.spare), free_ports(len(ids) + len(self.spare)), strict=True)
+        )
         self.shards = shards
         self.data_dir = data_dir
         self.procs: dict[str, subprocess.Popen] = {}
 
     def args(self, node_id):
-        peers = [f"--peer={i}=127.0.0.1:{p}" for i, p in self.ports.items() if i != node_id]
+        # The first nodes only know each other, a spare one learns of the rest from the log.
+        known = (
+            self.ports
+            if node_id in self.spare
+            else {i: p for i, p in self.ports.items() if i not in self.spare}
+        )
+        peers = [f"--peer={i}=127.0.0.1:{p}" for i, p in known.items() if i != node_id]
         listen = f"127.0.0.1:{self.ports[node_id]}"
         args = ["--id", node_id, "--listen", listen, "--shards", str(self.shards), *peers]
         if self.data_dir is not None:
             args += ["--data-dir", str(self.data_dir)]
+        if node_id in self.spare:
+            args.append("--empty")
         return args
 
     def start(self, node_id=None):
-        for i in [node_id] if node_id else list(self.ports):
+        for i in [node_id] if node_id else [i for i in self.ports if i not in self.spare]:
             cmd = [sys.executable, "-m", "knowdes.node", *self.args(i)]
             self.procs[i] = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
 
@@ -80,9 +92,9 @@ class LocalCluster:
         found = {}
         for shard in range(self.shards):
             claims = sorted(
-                (st["shards"][shard]["term"], node)
+                (_replica(st, shard)["term"], node)
                 for node, st in status.items()
-                if st["shards"][shard]["role"] == "leader"
+                if _replica(st, shard).get("role") == "leader"
             )
             unique = claims and (len(claims) == 1 or claims[-1][0] > claims[-2][0])
             found[shard] = claims[-1][1] if unique else None
@@ -115,3 +127,8 @@ class LocalCluster:
 
     async def control(self, node_id, action, peers=None):
         return await self.request(node_id, {"type": "Control", "action": action, "peers": peers})
+
+
+def _replica(status, shard):
+    """The replica of one shard in a Status reply, empty if the node has none."""
+    return next((r for r in status["shards"] if r["shard"] == shard), {})

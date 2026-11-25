@@ -65,6 +65,13 @@ class Client:
                 continue
             last = reply
             if reply["type"] == "Redirect":
+                # A node added at runtime (#14): the redirect brings its address.
+                if (
+                    reply.get("leader")
+                    and reply.get("address")
+                    and reply["leader"] not in self.nodes
+                ):
+                    self.nodes[reply["leader"]] = (reply["address"][0], int(reply["address"][1]))
                 if reply.get("leader") in self.nodes and reply["leader"] != node:
                     self.leaders[shard] = reply["leader"]
                 else:  # election still running
