@@ -21,7 +21,8 @@
   .node { border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
   .node.down { color: var(--down); }
   .node.paused { border-style: dashed; }
-  .node b { display: block; margin-bottom: 4px; }
+  .node b { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .node b button { font-size: 12px; padding: 1px 6px; }
   .replica { display: grid; grid-template-columns: 64px 1fr; gap: 4px; font-variant-numeric: tabular-nums; }
   .role-leader { color: var(--leader); font-weight: 600; }
   .role-candidate { color: var(--candidate); }
@@ -83,6 +84,9 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// Nodes with a Control on its way, their button stays disabled until it is answered.
+const pending = new Set();
+
 function showStatus(snapshot) {
   const box = $("nodes");
   box.replaceChildren();
@@ -95,7 +99,15 @@ function showStatus(snapshot) {
   }
   for (const [id, st] of Object.entries(snapshot.nodes)) {
     const card = el("div", { className: "node" + (st ? "" : " down") + (st?.paused ? " paused" : "") });
-    card.append(el("b", {}, id + (st ? (st.paused ? " (paused)" : "") : " (no answer)")));
+    const title = el("b", {}, el("span", {}, id + (st ? (st.paused ? " (paused)" : "") : " (no answer)")));
+    // Fault panel (docs/console-plan.md): pause and resume per node, sent as Control.
+    if (st) {
+      const action = st.paused ? "resume" : "pause";
+      const button = el("button", { type: "button", textContent: action, disabled: pending.has(id) });
+      Object.assign(button.dataset, { node: id, action });
+      title.append(button);
+    }
+    card.append(title);
     for (const r of st?.shards ?? []) {
       const behind = leaders[r.shard] ? leaders[r.shard].last_applied - r.last_applied : null;
       const lag = behind > 0 ? `, ${behind} behind` : "";
@@ -175,6 +187,28 @@ function connect() {
   source.addEventListener("status", (m) => showStatus(JSON.parse(m.data)));
   source.addEventListener("event", (m) => showEvent(JSON.parse(m.data)));
 }
+
+// The cards are rebuilt with every status, so the click is caught on the container.
+$("nodes").addEventListener("click", async (ev) => {
+  const button = ev.target.closest("button[data-node]");
+  if (!button) return;
+  const { node, action } = button.dataset;
+  pending.add(node);
+  button.disabled = true;
+  try {
+    const res = await fetch("/request", { method: "POST", body: JSON.stringify({ type: "Control", node, action }) });
+    const body = await res.json();
+    const r = body.reply ?? body;
+    $("took").textContent = `${action} ${node}: ${body.ms ?? "?"} ms`;
+    $("answer").className = r.ok ? "" : "error";
+    $("answer").textContent = JSON.stringify(r, null, 2);
+  } catch (err) {
+    $("answer").className = "error";
+    $("answer").textContent = String(err);
+  } finally {
+    pending.delete(node);
+  }
+});
 
 $("query").addEventListener("submit", async (ev) => {
   ev.preventDefault();

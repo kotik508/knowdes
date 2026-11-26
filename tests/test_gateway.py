@@ -182,3 +182,29 @@ async def test_console_page_has_timeline_filters(tmp_path):
     finally:
         await gateway.stop()
         cluster.stop()
+
+
+async def test_pause_and_resume_show_at_once(tmp_path):
+    async with setup(tmp_path) as (_, gateway):
+        await post(gateway, {"type": "Control", "node": "n2", "action": "pause"})
+        # The snapshot is fresh right after the reply, without waiting for the next poll.
+        assert gateway.snapshot()["nodes"]["n2"]["paused"] is True
+        reply = await post(gateway, {"type": "Control", "node": "n2", "action": "resume"})
+        assert reply["reply"]["paused"] is False
+        assert gateway.snapshot()["nodes"]["n2"]["paused"] is False
+
+
+async def test_console_page_has_pause_buttons(tmp_path):
+    cluster = LocalCluster(data_dir=tmp_path)
+    cluster.start()
+    nodes = {n: ("127.0.0.1", p) for n, p in cluster.ports.items()}
+    gateway = Gateway(nodes, cluster.shards)
+    try:
+        await gateway.start("127.0.0.1", 0)
+        _, body = await http(gateway, "GET", "/")
+        page = body.decode()
+        assert 'type: "Control", node, action' in page
+        assert 'st.paused ? "resume" : "pause"' in page
+    finally:
+        await gateway.stop()
+        cluster.stop()

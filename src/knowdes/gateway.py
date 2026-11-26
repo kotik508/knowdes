@@ -168,6 +168,10 @@ class Gateway:
                     reply = await protocol.request(self.nodes[node], m, timeout=2.0)
                 except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
                     reply = {"type": "Error", "error": f"{node} does not answer"}
+                if m["type"] == "Control" and reply.get("ok"):
+                    # Show a pause or resume at once and not only with the next poll.
+                    self.status[node] = await self._status_of(node)
+                    self.publish("status", self.snapshot())
         else:
             reply = await self.router.handle(m)
         return {"reply": reply, "ms": round((time.perf_counter() - start) * 1000, 2)}
