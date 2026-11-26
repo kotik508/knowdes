@@ -13,6 +13,11 @@ the replica of a shard with --add, an old replica goes with --remove:
 
     python -m knowdes.placement --config deploy/local.toml --shard 0 --add n4=10.0.0.4:7101
     python -m knowdes.placement --config deploy/local.toml --shard 0 --remove n1
+
+--join adds a new node to every shard, the way the cluster grows from three
+nodes to six in tests/test_scaling.py:
+
+    python -m knowdes.placement --config deploy/local.toml --join n4=10.0.0.4:7101
 """
 
 from __future__ import annotations
@@ -28,6 +33,11 @@ from knowdes.protocol import Message
 TIMEOUT = 2.0
 # Move = (shard, current leader, new leader)
 Move = tuple[int, str, str]
+
+
+def _replica(status, shard):
+    """The replica of one shard in a Status reply, empty if the node has none."""
+    return next((r for r in status["shards"] if r["shard"] == shard), {})
 
 
 def current_leaders(status: dict[str, Message | None], shards: int) -> dict[int, str | None]:
@@ -118,6 +128,15 @@ async def remove_replica(
     return await change_replicas(nodes, shards, shard, {"type": "RemoveReplica", "node": node})
 
 
+async def join(
+    nodes: dict[str, tuple[str, int]], shards: int, node: str, address: str
+) -> list[Message]:
+    """Add a node to every shard. One shard after the other, because a shard
+    takes one membership change at a time and the new replica has to catch up."""
+    nodes = {**nodes, node: protocol.parse_address(address)}
+    return [await add_replica(nodes, shards, shard, node, address) for shard in range(shards)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Spread the shard leaders over the nodes.")
     parser.add_argument("--config", type=Path, required=True)
@@ -126,9 +145,15 @@ def main() -> None:
     change = parser.add_mutually_exclusive_group()
     change.add_argument("--add", metavar="ID=HOST:PORT", help="add a replica of --shard")
     change.add_argument("--remove", metavar="ID", help="remove a replica of --shard")
+    change.add_argument("--join", metavar="ID=HOST:PORT", help="add a node to every shard")
     args = parser.parse_args()
     cluster = config.load(args.config)
     nodes = dict(cluster.nodes)
+    if args.join:
+        node, _, address = args.join.partition("=")
+        for reply in asyncio.run(join(nodes, cluster.shards, node, address)):
+            print(json.dumps(reply))
+        return
     if args.add or args.remove:
         if args.shard is None:
             parser.error("--add and --remove need --shard")
@@ -153,8 +178,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def _replica(status, shard):
-    """The replica of one shard in a Status reply, empty if the node has none."""
-    return next((r for r in status["shards"] if r["shard"] == shard), {})
