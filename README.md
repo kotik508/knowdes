@@ -83,7 +83,7 @@ uv run knowdes neighbors niklander --direction in --depth 2
 uv run knowdes delete CSM13001 teacher niklander
 ```
 
-A plain write adds the reverse edge on the shard of the object as a second write, which becomes atomic with two-phase commit (#12). Facts with a source version get no reverse edge until then, because a newer version replaces the old value and its old reverse edge would stay behind.
+A plain write and its reverse edge on the shard of the object go in one two-phase commit (#12), so either both are there or neither is. If another transaction holds the subject or the object, the write aborts and the client tries again a few times. Facts with a source version get no reverse edge, because a newer version replaces the old value and its old reverse edge would stay behind.
 
 Until the console exists a node can be watched and disturbed from the command line:
 

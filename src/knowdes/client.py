@@ -2,10 +2,10 @@
 
 Picks the shard from the subject, sends to the shard's leader and follows a
 Redirect. A plain write also adds the reverse edge on the shard of the object,
-so Neighbors can walk edges backwards. Until two-phase commit (#12) the two
-writes are not atomic: the forward fact is written first, and if the reverse
-write fails the caller gets an error and may repeat the whole write, which is
-harmless because a set does not mind a second put.
+so Neighbors can walk edges backwards. Both go in one two-phase commit (#12),
+so a fact never exists without its reverse edge or the other way round. Only
+BatchPut, which loads whole sources, still writes them one after the other;
+repeating a failed batch is harmless because a set does not mind a second put.
 
 The router process (knowdes.router) wraps this class, the source adapters use
 it directly. The CLI talks to a router (knowdes.cli).
@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -33,6 +34,10 @@ BATCH_SIZE = 500
 # Neighbors stops here, a walk over the whole graph is not a query.
 MAX_DEPTH = 3
 READ_LEVELS = ("leader", "follower")
+# A write aborts when another transaction holds its subject. It tries again with
+# a new transaction this often, waiting a little longer each time.
+TX_RETRIES = 5
+TX_BACKOFF = 0.05
 
 
 class Client:
@@ -104,13 +109,20 @@ class Client:
 
     async def write(self, op: str, s: str, p: str, o: str, version: int | None = None) -> Message:
         """Put or Delete one fact and, for a plain write, its reverse edge."""
-        msg: Message = {"type": op, "s": s, "p": p, "o": o, "version": version}
-        reply = await self.call(shard_of(s, self.shards), msg)
-        if version is None:
+        if version is not None:
             # A source fact replaces its old value and the old reverse edge would
-            # stay behind, so source facts get reverse edges only with #12.
-            await self.call(shard_of(o, self.shards), {**msg, "reverse": True})
-        return reply
+            # stay behind, so source facts have no reverse edges.
+            msg: Message = {"type": op, "s": s, "p": p, "o": o, "version": version}
+            return await self.call(shard_of(s, self.shards), msg)
+        kind = op.lower()
+        facts = [{"op": kind, "s": s, "p": p, "o": o}, {"op": "r" + kind, "s": s, "p": p, "o": o}]
+        reply: Message = {}
+        for attempt in range(TX_RETRIES):
+            reply = await self.transact(facts)
+            if reply["decision"] == "commit":
+                return reply
+            await asyncio.sleep(TX_BACKOFF * (attempt + 1) * (1 + random.random()))
+        raise ConnectionError(f"{op} {s} {p} {o} aborted {TX_RETRIES} times: {reply}")
 
     async def transact(self, facts: list[dict[str, Any]], tx: str | None = None) -> Message:
         """Write facts on several shards with two-phase commit (#12): all or none.

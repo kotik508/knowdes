@@ -109,3 +109,49 @@ async def test_follower_redirects_a_transaction(tmp_path):
         assert reply["leader"] == leaders[0]
     finally:
         cluster.stop()
+
+
+async def test_put_writes_the_reverse_edge_in_the_same_transaction(tmp_path):
+    cluster, _, client = await setup(tmp_path)
+    try:
+        a, b = two_subjects()
+        reply = await client.put(a, "room", b)
+        assert reply["decision"] == "commit"
+        assert sorted(reply["votes"]) == sorted({str(shard_of(a, 3)), str(shard_of(b, 3))})
+        assert (await client.read(b))["incoming"] == {"room": [a]}
+        await client.delete(a, "room", b)
+        assert await client.get(a) == {}
+        assert (await client.read(b))["incoming"] == {}
+    finally:
+        cluster.stop()
+
+
+async def test_no_fact_without_its_reverse_edge(tmp_path, monkeypatch):
+    monkeypatch.setattr("knowdes.client.TX_BACKOFF", 0.01)
+    cluster, nodes, client = await setup(tmp_path)
+    try:
+        a, b = two_subjects()
+        leaders = await cluster.leaders()
+        shard_b = shard_of(b, cluster.shards)
+        # Another transaction holds b, so the reverse edge cannot be written.
+        blocker = {
+            "type": "Prepare",
+            "shard": shard_b,
+            "tx": "blocker",
+            "facts": [{"op": "rput", "s": "other", "p": "room", "o": b}],
+        }
+        assert (await protocol.request(nodes[leaders[shard_b]], blocker, 2.0))["vote"] is True
+        try:
+            await client.put(a, "room", b)
+            raise AssertionError("put went through a locked object")
+        except ConnectionError as err:
+            assert "aborted" in str(err)
+        # The forward fact did not go in alone.
+        assert await client.get(a) == {}
+        # Once the other transaction is decided, the same put goes through.
+        done = {"type": "Abort", "shard": shard_b, "tx": "blocker"}
+        await protocol.request(nodes[leaders[shard_b]], done, 2.0)
+        await client.put(a, "room", b)
+        assert (await client.read(b))["incoming"] == {"room": [a]}
+    finally:
+        cluster.stop()
