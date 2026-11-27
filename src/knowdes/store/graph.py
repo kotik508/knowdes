@@ -102,7 +102,11 @@ class ShardStore:
             facts = list(command["facts"])
             keys = {_lock_key(f) for f in facts}
             busy = any(self.locks.get(k, tx) != tx for k in keys)
-            self.txs[tx] = {"state": REFUSED if busy else PREPARED, "facts": facts}
+            self.txs[tx] = {
+                "state": REFUSED if busy else PREPARED,
+                "facts": facts,
+                "coordinator": command.get("coordinator"),
+            }
             if not busy:
                 for key in keys:
                     self.locks[key] = tx
@@ -129,6 +133,11 @@ class ShardStore:
     def open_transactions(self) -> list[str]:
         """Prepared transactions still waiting for their decision."""
         return sorted(t for t, r in self.txs.items() if r["state"] == PREPARED)
+
+    def coordinator(self, tx: str) -> int | None:
+        """Shard whose log holds the decision, None for a prepare from outside."""
+        record = self.txs.get(tx)
+        return record.get("coordinator") if record else None
 
     def decision(self, tx: str) -> Command | None:
         return self.decisions.get(tx)

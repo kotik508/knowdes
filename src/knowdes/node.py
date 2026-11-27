@@ -37,6 +37,11 @@ from knowdes.store import ShardStore
 PEER_TIMEOUT = 0.1
 # How long the coordinator looks for the leader of a participant shard (#12).
 TX_PATIENCE = 2.0
+# A participant whose transaction stays prepared this long asks the coordinator shard
+# for the decision. Longer than a coordinator needs to collect the votes, so in the
+# normal case the Commit or Abort arrives first.
+TX_RECOVERY_AFTER = 3.0
+TX_RECOVERY_INTERVAL = 0.25
 # Ops a transaction may write: facts and reverse edges.
 TX_FACT_OPS = ("put", "delete", "rput", "rdelete")
 
@@ -68,6 +73,9 @@ class StorageNode:
         # Fault injection through Control messages, for the console and the tests.
         self.paused = False
         self.isolated: set[str] = set()
+        # Recovery of prepared transactions (#12): when this node first saw each one open.
+        self.open_since: dict[tuple[int, str], float] = {}
+        self.recovery: asyncio.Task | None = None
 
     def add_group(self, shard: int, members: list[str]) -> RaftGroup:
         self.stores[shard] = store = ShardStore()
@@ -116,8 +124,11 @@ class StorageNode:
         self.started = True
         for group in self.groups.values():
             group.start()
+        self.recovery = asyncio.create_task(self.recover_loop())
 
     async def stop(self) -> None:
+        if self.recovery is not None:
+            self.recovery.cancel()
         for group in self.groups.values():
             await group.stop()
         if self.server is not None:
@@ -199,6 +210,8 @@ class StorageNode:
             return await self.coordinate(m)
         if kind in ("Prepare", "Commit", "Abort"):
             return await self.participate(m)
+        if kind == "TxStatus":
+            return await self.tx_status(m)
         if kind == "Get":
             return await self.get(m)
         return {"type": "Error", "error": f"unknown message type {kind}"}
@@ -275,7 +288,15 @@ class StorageNode:
         participants = sorted(writes)
         replies = await asyncio.gather(
             *(
-                self.ask_leader(shard, {"type": "Prepare", "tx": tx, "facts": writes[shard]})
+                self.ask_leader(
+                    shard,
+                    {
+                        "type": "Prepare",
+                        "tx": tx,
+                        "facts": writes[shard],
+                        "coordinator": group.shard,
+                    },
+                )
                 for shard in participants
             )
         )
@@ -321,7 +342,12 @@ class StorageNode:
             return {"type": "Error", "error": "unknown shard"}
         tx = str(m.get("tx"))
         if m["type"] == "Prepare":
-            command: Message = {"op": "prepare", "tx": tx, "facts": list(m.get("facts", []))}
+            command: Message = {
+                "op": "prepare",
+                "tx": tx,
+                "facts": list(m.get("facts", [])),
+                "coordinator": m.get("coordinator"),
+            }
         else:
             command = {"op": m["type"].lower(), "tx": tx}
         try:
@@ -338,6 +364,66 @@ class StorageNode:
         self.events.emit(f"tx {state}", group.shard, tx=tx)
         return {"type": "Ack", "ok": True, "shard": group.shard, "tx": tx, "state": state}
 
+    async def tx_status(self, m: Message) -> Message:
+        """TxStatus at the coordinator shard: the decision, abort if none was made.
+
+        A participant asks when its transaction stays prepared, because the
+        coordinator crashed before or after deciding. Without a decision in the log
+        the coordinator shard decides abort itself. The first decision in the log is
+        final, so a coordinator that comes back with commit gets abort as well.
+        """
+        group = self.groups.get(m.get("shard"))
+        if group is None:
+            return {"type": "Error", "error": "unknown shard"}
+        if not group.is_leader():
+            return self.redirect(m, group.leader)
+        tx = str(m.get("tx"))
+        store = self.stores[group.shard]
+        if store.decision(tx) is None:
+            record = {"op": "decide", "tx": tx, "decision": "abort", "participants": []}
+            try:
+                await group.propose(record)
+            except NotLeaderError as err:
+                return self.redirect(m, err.leader)
+            except TimeoutError:
+                return {"type": "Error", "error": "decision not committed"}
+            self.events.emit("decide", group.shard, tx=tx, decision="abort", recovered=True)
+        decision = store.decision(tx)["decision"]
+        return {"type": "Decision", "ok": True, "tx": tx, "decision": decision}
+
+    async def recover_loop(self) -> None:
+        """Finish transactions whose coordinator did not send Commit or Abort."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(TX_RECOVERY_INTERVAL)
+            if self.paused:
+                continue
+            now = loop.time()
+            seen = set()
+            for shard, group in list(self.groups.items()):
+                if not group.is_leader():
+                    continue
+                store = self.stores[shard]
+                for tx in store.open_transactions():
+                    coordinator = store.coordinator(tx)
+                    if coordinator is None:
+                        continue
+                    key = (shard, tx)
+                    seen.add(key)
+                    since = self.open_since.setdefault(key, now)
+                    if now - since >= TX_RECOVERY_AFTER:
+                        await self.resolve(shard, tx, coordinator)
+            self.open_since = {k: v for k, v in self.open_since.items() if k in seen}
+
+    async def resolve(self, shard: int, tx: str, coordinator: int) -> None:
+        reply = await self.ask_leader(coordinator, {"type": "TxStatus", "tx": tx})
+        if reply is None:
+            return
+        kind = "Commit" if reply["decision"] == "commit" else "Abort"
+        done = await self.participate({"type": kind, "shard": shard, "tx": tx})
+        if done.get("ok"):
+            self.events.emit("recovered", shard, tx=tx, decision=reply["decision"])
+
     async def ask_leader(self, shard: int, msg: Message) -> Message | None:
         """Send to the leader of a shard, this node included. None if none answers in time."""
         msg = {**msg, "shard": shard}
@@ -351,7 +437,7 @@ class StorageNode:
             tried += 1
             hint = None
             if node == self.id:
-                reply = await self.participate(msg) if shard in self.groups else None
+                reply = await self.handle(msg) if shard in self.groups else None
             else:
                 reply = await self.call_peer(node, msg)
             if reply is None:

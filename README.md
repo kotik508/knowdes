@@ -85,6 +85,8 @@ uv run knowdes delete CSM13001 teacher niklander
 
 A plain write and its reverse edge on the shard of the object go in one two-phase commit (#12), so either both are there or neither is. If another transaction holds the subject or the object, the write aborts and the client tries again a few times. Facts with a source version get no reverse edge, because a newer version replaces the old value and its old reverse edge would stay behind.
 
+If the coordinator fails, a participant does not wait forever. A shard whose transaction stays prepared for three seconds asks the leader of the coordinator shard for the decision. The decision is in that shard's Raft log, so a new leader knows it. If there is none yet, the coordinator shard decides abort itself. The first decision in the log is final, so a coordinator that comes back later cannot turn it into a commit.
+
 Until the console exists a node can be watched and disturbed from the command line:
 
 ```sh
