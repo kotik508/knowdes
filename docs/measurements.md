@@ -1,6 +1,6 @@
 # Measurements
 
-Laptop measurement, not the course machines. All numbers below come from one run on 27 November 2026 on a single laptop (AMD Ryzen 7 7840U, 16 threads, Linux 7.2, Python 3.13). Every storage node, the router and the benchmark client ran on that one machine and talked over loopback, so the numbers show what the protocols cost relative to each other and not what a cluster of separate machines can do. The raw results are in [measurements/laptop-2026-11-27.jsonl](measurements/laptop-2026-11-27.jsonl), one JSON line per run (#15).
+Laptop measurement, not the course machines. All numbers below come from one run on 27 November 2026 on a single laptop (AMD Ryzen 7 7840U, 16 threads, Linux 7.2, Python 3.13). Every storage node, the router and the benchmark client ran on that one machine and talked over loopback, so the numbers show what the protocols cost relative to each other and not what a cluster of separate machines can do. The raw results are in [measurements/laptop-2026-11-27.jsonl](measurements/laptop-2026-11-27.jsonl), one JSON line per run (#15). The charts come from `python -m knowdes.charts` and show the same numbers. The failover chart averages the three shards.
 
 ## Setup
 
@@ -13,6 +13,10 @@ Three clusters one after the other with 3, 4 and 5 storage nodes, 3 shards each 
 All processes ran with `nice -n 15`. No run had an error.
 
 ## Writes
+
+![Write throughput](measurements/writes.svg)
+
+![Write latency](measurements/latency.svg)
 
 | nodes | clients | writes/s | median ms | p95 ms |
 |---|---|---|---|---|
@@ -30,6 +34,8 @@ Every put also writes its reverse edge. Since 26 November both go through one tw
 
 ## Reads
 
+![Read latency](measurements/reads.svg)
+
 | nodes | read | reads/s | median ms | p95 ms |
 |---|---|---|---|---|
 | 3 | leader | 1846.9 | 8.13 | 12.41 |
@@ -42,6 +48,8 @@ Every put also writes its reverse edge. Since 26 November both go through one tw
 A leader read first confirms with a majority that the leader still leads (ReadIndex), a follower read answers from what the replica has applied. The follower read is about twice as fast and may miss the newest writes (#10).
 
 ## Failover
+
+![Time to a new leader](measurements/failover.svg)
 
 | nodes | shard | mean ms | median ms | p95 ms |
 |---|---|---|---|---|
@@ -62,4 +70,5 @@ The time runs from pausing the leader until another node reports itself leader o
 ```
 deploy/local.sh start      # or a config with more nodes
 deploy/bench.sh deploy/local.toml "3 nodes"
+python -m knowdes.charts data/bench-results.jsonl docs/measurements
 ```

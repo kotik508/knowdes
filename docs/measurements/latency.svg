@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" font-family="sans-serif" font-size="12">
+<rect width="640" height="360" fill="white"/>
+<text x="64" y="22" font-size="14">Write latency, 8 clients</text>
+<line x1="64" y1="304.0" x2="624" y2="304.0" stroke="#ddd"/>
+<text x="58" y="308.0" text-anchor="end">0</text>
+<line x1="64" y1="216.0" x2="624" y2="216.0" stroke="#ddd"/>
+<text x="58" y="220.0" text-anchor="end">50</text>
+<line x1="64" y1="128.0" x2="624" y2="128.0" stroke="#ddd"/>
+<text x="58" y="132.0" text-anchor="end">100</text>
+<line x1="64" y1="40.0" x2="624" y2="40.0" stroke="#ddd"/>
+<text x="58" y="44.0" text-anchor="end">150</text>
+<text x="14" y="172.0" transform="rotate(-90 14 172.0)" text-anchor="middle">milliseconds</text>
+<rect x="92.0" y="222.1" width="63.3" height="81.9" fill="#3b6ea5"><title>median: 46.53</title></rect>
+<text x="123.7" y="218.1" text-anchor="middle" font-size="10">46.5</text>
+<rect x="157.3" y="205.3" width="63.3" height="98.7" fill="#d08c2f"><title>95th percentile: 56.1</title></rect>
+<text x="189.0" y="201.3" text-anchor="middle" font-size="10">56.1</text>
+<text x="157.3" y="322" text-anchor="middle">3 nodes</text>
+<rect x="278.7" y="207.1" width="63.3" height="96.9" fill="#3b6ea5"><title>median: 55.07</title></rect>
+<text x="310.3" y="203.1" text-anchor="middle" font-size="10">55.1</text>
+<rect x="344.0" y="69.7" width="63.3" height="234.3" fill="#d08c2f"><title>95th percentile: 133.1</title></rect>
+<text x="375.7" y="65.7" text-anchor="middle" font-size="10">133</text>
+<text x="344.0" y="322" text-anchor="middle">4 nodes</text>
+<rect x="465.3" y="196.5" width="63.3" height="107.5" fill="#3b6ea5"><title>median: 61.06</title></rect>
+<text x="497.0" y="192.5" text-anchor="middle" font-size="10">61.1</text>
+<rect x="530.7" y="130.5" width="63.3" height="173.5" fill="#d08c2f"><title>95th percentile: 98.57</title></rect>
+<text x="562.3" y="126.5" text-anchor="middle" font-size="10">98.6</text>
+<text x="530.7" y="322" text-anchor="middle">5 nodes</text>
+<rect x="64" y="336" width="10" height="10" fill="#3b6ea5"/>
+<text x="78" y="346">median</text>
+<rect x="214" y="336" width="10" height="10" fill="#d08c2f"/>
+<text x="228" y="346">95th percentile</text>
+</svg>

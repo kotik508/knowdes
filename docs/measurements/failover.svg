@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" font-family="sans-serif" font-size="12">
+<rect width="640" height="360" fill="white"/>
+<text x="64" y="22" font-size="14">Time to a new leader</text>
+<line x1="64" y1="304.0" x2="624" y2="304.0" stroke="#ddd"/>
+<text x="58" y="308.0" text-anchor="end">0</text>
+<line x1="64" y1="216.0" x2="624" y2="216.0" stroke="#ddd"/>
+<text x="58" y="220.0" text-anchor="end">200</text>
+<line x1="64" y1="128.0" x2="624" y2="128.0" stroke="#ddd"/>
+<text x="58" y="132.0" text-anchor="end">400</text>
+<line x1="64" y1="40.0" x2="624" y2="40.0" stroke="#ddd"/>
+<text x="58" y="44.0" text-anchor="end">600</text>
+<text x="14" y="172.0" transform="rotate(-90 14 172.0)" text-anchor="middle">milliseconds</text>
+<rect x="92.0" y="230.6" width="63.3" height="73.4" fill="#3b6ea5"><title>mean: 166.883</title></rect>
+<text x="123.7" y="226.6" text-anchor="middle" font-size="10">167</text>
+<rect x="157.3" y="216.5" width="63.3" height="87.5" fill="#d08c2f"><title>95th percentile: 198.77</title></rect>
+<text x="189.0" y="212.5" text-anchor="middle" font-size="10">199</text>
+<text x="157.3" y="322" text-anchor="middle">3 nodes</text>
+<rect x="278.7" y="189.9" width="63.3" height="114.1" fill="#3b6ea5"><title>mean: 259.423</title></rect>
+<text x="310.3" y="185.9" text-anchor="middle" font-size="10">259</text>
+<rect x="344.0" y="79.5" width="63.3" height="224.5" fill="#d08c2f"><title>95th percentile: 510.2</title></rect>
+<text x="375.7" y="75.5" text-anchor="middle" font-size="10">510</text>
+<text x="344.0" y="322" text-anchor="middle">4 nodes</text>
+<rect x="465.3" y="235.8" width="63.3" height="68.2" fill="#3b6ea5"><title>mean: 155.077</title></rect>
+<text x="497.0" y="231.8" text-anchor="middle" font-size="10">155</text>
+<rect x="530.7" y="225.7" width="63.3" height="78.3" fill="#d08c2f"><title>95th percentile: 177.927</title></rect>
+<text x="562.3" y="221.7" text-anchor="middle" font-size="10">178</text>
+<text x="530.7" y="322" text-anchor="middle">5 nodes</text>
+<rect x="64" y="336" width="10" height="10" fill="#3b6ea5"/>
+<text x="78" y="346">mean</text>
+<rect x="214" y="336" width="10" height="10" fill="#d08c2f"/>
+<text x="228" y="346">95th percentile</text>
+</svg>
