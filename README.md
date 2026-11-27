@@ -47,7 +47,7 @@ Every topic of the design plan has one place in the code, so the report can poin
 | `src/knowdes/cli.py`, `src/knowdes/mcp_server.py` | clients | section 2 |
 | `console/` | gateway and web console | section 5 |
 | `deploy/` | cluster config and start and stop scripts for the three machines | section 6 |
-| `bench/` | measurements for the report | section 7 |
+| `src/knowdes/bench.py`, `docs/measurements.md` | measurements for the report, first results from a laptop | section 7 |
 | `tests/` | unit tests with a simulated network, local runs with three processes | |
 | `docs/` | design plan and later the report | |
 
