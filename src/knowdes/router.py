@@ -1,9 +1,11 @@
 """Router: stateless entry point for clients (design plan section 2, issue #7).
 
 A client sends Put, Delete, BatchPut, Get or Neighbors without knowing about
-shards. The router hashes the subject to its shard, forwards to that shard's
-leader and follows Redirects. It keeps nothing but a cache of who leads which
-shard, so any router can be used and a router can be restarted at any time.
+shards. The router only translates: knowdes.client hashes the subject to its
+shard, finds the leader, follows Redirects and runs the two-phase commit of a
+write with its reverse edge. The only state is the client's guess of who leads
+which shard, so any router can be used and a router can be restarted at any time.
+One request per connection, answered with Reply or Error.
 
     python -m knowdes.router --config deploy/local.toml [--listen 127.0.0.1:7110]
 """
@@ -55,6 +57,7 @@ class Router:
             writer.close()
 
     async def handle(self, m: Message) -> Message:
+        """One request, never raises: a bad message or an unreachable shard becomes Error."""
         ident = m.get("id")
         try:
             result = await self.dispatch(m)
@@ -66,16 +69,21 @@ class Router:
 
     async def dispatch(self, m: Message) -> Message:
         c, kind = self.client, m["type"]
+        # A plain Put or Delete is a two-phase commit with the reverse edge (#12).
         if kind in ("Put", "Delete"):
             reply = await c.write(kind, str(m["s"]), str(m["p"]), str(m["o"]), m.get("version"))
             return {"index": reply["index"]}
+        # BatchPut is for imports: batches per shard, the reverse edges in a second
+        # round and without two-phase commit, so they can lag behind the facts.
         if kind == "BatchPut":
             await c.put_many(list(m["facts"]))
             return {"count": len(m["facts"])}
         if kind == "Get":
             reply = await c.read(str(m["s"]), m.get("read", "leader"))
+            # node and applied tell which replica answered and how far it was.
             keep = ("facts", "incoming", "node", "read", "applied")
             return {k: reply[k] for k in keep}
+        # Neighbors walks the graph in the router, one Get per node and level.
         if kind == "Neighbors":
             return await c.neighbors(
                 str(m["s"]),
