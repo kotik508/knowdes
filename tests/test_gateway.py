@@ -6,7 +6,7 @@ import json
 
 from cluster import LocalCluster
 
-from knowdes.gateway import Gateway
+from knowdes.gateway import STATIC, Gateway
 
 ALL = {"n1", "n2", "n3"}
 
@@ -208,3 +208,33 @@ async def test_console_page_has_pause_buttons(tmp_path):
     finally:
         await gateway.stop()
         cluster.stop()
+
+
+async def test_events_of_a_transaction_reach_the_console(tmp_path):
+    """A Put is a two-phase commit, the console groups its events by tx (#11, #12)."""
+    async with setup(tmp_path, STATIC) as (_, gateway):
+        reader, writer = await asyncio.open_connection(*gateway.address)
+        writer.write(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        await post(gateway, {"type": "Put", "s": "CSM13001", "p": "teacher", "o": "niklander"})
+        committed = set()
+
+        def both_committed(e):
+            if e.get("kind") == "tx committed":
+                committed.add(e["shard"])
+            return len(committed) == 2
+
+        seen = await read_events(reader, both_committed)
+        writer.close()
+        _, body = await http(gateway, "GET", "/")
+    by_kind = {}
+    for e in seen:
+        if e.get("tx"):
+            by_kind.setdefault(e["kind"], []).append(e)
+    assert {e["tx"] for kind in by_kind.values() for e in kind} == {by_kind["decide"][0]["tx"]}
+    assert len(by_kind["prepare"]) == 2 and all(e["vote"] for e in by_kind["prepare"])
+    assert by_kind["decide"][0]["decision"] == "commit"
+    page = body.decode()
+    assert 'id="txs"' in page
+    for kind in ('"prepare"', '"decide"', '"tx committed"', '"recovered"'):
+        assert kind in page

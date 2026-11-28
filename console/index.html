@@ -38,6 +38,14 @@
   button { grid-column: 2; justify-self: start; }
   pre { background: var(--bg); padding: 8px; overflow: auto; max-height: 30vh; font-size: 12px; }
   .error { color: var(--bad); }
+  #txs { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow: auto; font: 12px/1.5 ui-monospace, monospace; }
+  #txs li { border-bottom: 1px solid var(--line); padding: 4px 0; cursor: pointer; }
+  #txs li.chosen { background: var(--bg); }
+  #txs .commit { color: var(--leader); font-weight: 600; }
+  #txs .abort { color: var(--bad); font-weight: 600; }
+  #txs .open { color: var(--candidate); }
+  #txs .steps, #txs .t { color: var(--muted); }
+  #txs .steps { padding-left: 1em; }
   @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -51,6 +59,7 @@
         <label>Shard <select id="f-shard"><option value="">all</option></select></label>
         <label>Kind <select id="f-kind"><option value="">all</option></select></label>
         <label>Node <select id="f-node"><option value="">all</option></select></label>
+        <span id="f-tx" hidden>Transaction <b></b> <button type="button">all</button></span>
         <span id="f-count"></span>
       </div>
       <ul id="timeline"></ul></section>
@@ -70,6 +79,8 @@
     </form>
     <p id="took"></p>
     <pre id="answer"></pre>
+    <h2 style="margin-top:16px">Transactions</h2>
+    <ul id="txs"></ul>
   </section>
 </main>
 <script>
@@ -120,6 +131,9 @@ function showStatus(snapshot) {
   }
 }
 
+// A click on a transaction shows only its events in the timeline.
+let chosenTx = "";
+
 // Timeline filters (design plan section 5): by shard, by kind of event and by node.
 // An event without a shard (pause, up, down) belongs to every shard.
 const seen = { shard: new Set(), kind: new Set(), node: new Set() };
@@ -139,7 +153,8 @@ function matches(item) {
   const shard = $("f-shard").value, kind = $("f-kind").value, node = $("f-node").value;
   return (!shard || item.dataset.shard === "" || item.dataset.shard === shard)
     && (!kind || item.dataset.kind === kind)
-    && (!node || item.dataset.node === node);
+    && (!node || item.dataset.node === node)
+    && (!chosenTx || item.dataset.tx === chosenTx);
 }
 
 function applyFilters() {
@@ -168,7 +183,8 @@ function showEvent(e) {
   const shard = e.shard === null || e.shard === undefined ? "" : ` s${e.shard}`;
   const item = el("li", {}, el("span", { className: "t" }, time + " "), `${e.node}${shard} ${e.kind} ${rest}`);
   const shardId = e.shard === null || e.shard === undefined ? "" : String(e.shard);
-  Object.assign(item.dataset, { shard: shardId, kind: e.kind, node: e.node });
+  Object.assign(item.dataset, { shard: shardId, kind: e.kind, node: e.node, tx: e.tx ?? "" });
+  if (e.tx) showTx(e);
   addOption("shard", shardId);
   addOption("kind", e.kind);
   addOption("node", e.node);
@@ -179,6 +195,69 @@ function showEvent(e) {
   const shown = [...list.children].filter((li) => !li.classList.contains("hidden")).length;
   $("f-count").textContent = `${shown} of ${list.children.length}`;
 }
+
+// Two-phase commit (#12) per transaction, from the events of the leaders:
+// prepare and its vote on every participant, decide on the coordinator shard,
+// then committed or aborted on every participant, recovered if a participant
+// had to ask the coordinator shard itself.
+const KEEP_TX = 50;
+const txs = new Map();
+
+function showTx(e) {
+  let tx = txs.get(e.tx);
+  if (!tx) {
+    tx = { id: e.tx, start: e.time, end: e.time, votes: {}, done: {}, decision: null, coordinator: null, recovered: [] };
+    txs.set(e.tx, tx);
+  }
+  tx.start = Math.min(tx.start, e.time);
+  tx.end = Math.max(tx.end, e.time);
+  if (e.kind === "prepare") tx.votes[e.shard] = e.vote;
+  if (e.kind === "decide") Object.assign(tx, { decision: e.decision, coordinator: e.shard });
+  if (e.kind === "tx committed" || e.kind === "tx aborted") tx.done[e.shard] = e.kind.slice(3);
+  if (e.kind === "recovered") {
+    tx.done[e.shard] = e.decision === "commit" ? "committed" : "aborted";
+    tx.recovered.push(e.shard);
+  }
+  while (txs.size > KEEP_TX) txs.delete(txs.keys().next().value);
+  drawTxs();
+}
+
+function drawTxs() {
+  const list = $("txs");
+  list.replaceChildren();
+  for (const tx of [...txs.values()].reverse()) {
+    const state = tx.decision ?? "open";
+    const shards = [...new Set([...Object.keys(tx.votes), ...Object.keys(tx.done)])].sort();
+    const steps = shards.map((s) => {
+      const vote = s in tx.votes ? (tx.votes[s] ? "yes" : "no") : "?";
+      const recovered = tx.recovered.includes(Number(s)) ? " (asked coordinator)" : "";
+      return `s${s} vote ${vote}, ${tx.done[s] ?? "prepared"}${recovered}`;
+    });
+    const ms = Math.round((tx.end - tx.start) * 1000);
+    const head = el("div", {},
+      el("span", { className: "t" }, new Date(tx.start * 1000).toLocaleTimeString() + " "),
+      `${tx.id.slice(0, 8)} `, el("span", { className: state }, state),
+      tx.coordinator === null ? "" : ` coordinator s${tx.coordinator}`, `, ${ms} ms`);
+    const item = el("li", { className: tx.id === chosenTx ? "chosen" : "" }, head,
+      el("div", { className: "steps" }, steps.join("; ")));
+    item.dataset.tx = tx.id;
+    list.append(item);
+  }
+}
+
+function chooseTx(id) {
+  chosenTx = id;
+  $("f-tx").hidden = !id;
+  $("f-tx").querySelector("b").textContent = id.slice(0, 8);
+  applyFilters();
+  drawTxs();
+}
+
+$("txs").addEventListener("click", (ev) => {
+  const item = ev.target.closest("li[data-tx]");
+  if (item) chooseTx(item.dataset.tx === chosenTx ? "" : item.dataset.tx);
+});
+$("f-tx").querySelector("button").addEventListener("click", () => chooseTx(""));
 
 function connect() {
   const source = new EventSource("/events");
