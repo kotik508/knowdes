@@ -1,6 +1,6 @@
 # Web console, plan for the first stage (#11)
 
-Issue #11 asks for a plan before anything is built. This is the plan for the group to agree on. Nothing of it exists yet.
+Issue #11 asked for a plan before anything was built. The first stage below is built. Of the second stage the console also shows the steps of a two-phase commit (list of transactions). Isolate and the request route are still open.
 
 ## What the demo needs
 
